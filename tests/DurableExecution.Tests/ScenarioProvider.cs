@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.Text.Json;
 using Microsoft.Data.SqlClient;
+using Microsoft.Data.Sqlite;
+using Npgsql;
 
 namespace DurableExecution.Tests;
 
@@ -252,5 +254,186 @@ public sealed class SqlScenarioProvider : ScenarioProvider
             catch (SqlException) { /* best-effort cleanup of a scratch database */ }
         }
         _databases.Clear();
+    }
+}
+
+
+/// <summary>
+/// The PostgreSQL provider's scenario side: each scenario gets a scratch
+/// database (history inside it); the state directory keeps the auxiliary
+/// state exactly as the other database runs.
+/// </summary>
+public sealed class PostgresScenarioProvider : ScenarioProvider
+{
+    private readonly Dictionary<string, (string Name, string Connection)> _databases = new();
+
+    public override string FreshState(string scenario)
+    {
+        string state = HostProcess.FreshState(scenario);
+        _databases[state] = PostgresTestDatabases.CreateDatabase(scenario);
+        return state;
+    }
+
+    protected override IReadOnlyDictionary<string, string>? ProviderEnv(string state) =>
+        new Dictionary<string, string>
+        {
+            ["HISTORY_PROVIDER"] = "postgresql",
+            ["HISTORY_POSTGRES_CONNECTION"] = _databases[state].Connection,
+        };
+
+    public override List<JsonElement> History(string state) =>
+        PostgresTestDatabases.ReadPayloads(_databases[state].Connection, ScenarioInstance)
+            .Select(p => JsonDocument.Parse(p).RootElement.Clone())
+            .ToList();
+
+    public override string HistoryText(string state) =>
+        string.Join("\n", PostgresTestDatabases.ReadPayloads(_databases[state].Connection, ScenarioInstance));
+
+    public override string CloneState(string state, string suffix)
+    {
+        string copy = CopyStateDir(state, suffix);
+        var clone = PostgresTestDatabases.CreateDatabase("clone");
+        _databases[copy] = clone;
+        PostgresTestDatabases.EnsureTable(clone.Connection);
+        var payloads = PostgresTestDatabases.ReadPayloads(_databases[state].Connection, ScenarioInstance);
+        for (int i = 0; i < payloads.Count; i++)
+            PostgresTestDatabases.InsertPayload(clone.Connection, ScenarioInstance, i + 1, payloads[i]);
+        return copy;
+    }
+
+    public override void DamageHistory(string state, HistoryDamage damage)
+    {
+        string connection = _databases[state].Connection;
+        switch (damage)
+        {
+            case HistoryDamage.InvalidJsonRecord:
+                PostgresTestDatabases.Execute(connection,
+                    "UPDATE public.history_events SET payload = '{this is not valid json' WHERE n = 3");
+                break;
+            case HistoryDamage.DeleteSecondRecord:
+                PostgresTestDatabases.Execute(connection,
+                    "DELETE FROM public.history_events WHERE n = 2");
+                break;
+            case HistoryDamage.TamperRecordedResult:
+                PostgresTestDatabases.Execute(connection,
+                    "UPDATE public.history_events SET payload = " +
+                    "REPLACE(payload, '\"result\":\"reserved\"', '\"result\":\"tampered\"')");
+                break;
+        }
+    }
+
+    public override void AssertUncommittedWriteDiscarded(string state)
+    {
+        var completions = History(state).Where(e =>
+            e.GetProperty("type").GetString() == "ActivityCompleted" &&
+            e.GetProperty("seq").GetInt64() == 1);
+        Assert.Empty(completions);
+    }
+
+    public override void AssertDiscardSurfaced(string state, HostRun resumeRun)
+    {
+        Assert.DoesNotContain("torn tail", resumeRun.Output);
+        _ = History(state);
+    }
+
+    public override void Dispose()
+    {
+        foreach (var db in _databases.Values)
+        {
+            try { PostgresTestDatabases.DropDatabase(db.Name); }
+            catch (NpgsqlException) { /* best-effort cleanup of a scratch database */ }
+        }
+        _databases.Clear();
+    }
+}
+
+/// <summary>
+/// The SQLite provider's scenario side: the history is the database file in
+/// the scenario's state directory; everything else is the file layout.
+/// </summary>
+public sealed class SqliteScenarioProvider : ScenarioProvider
+{
+    public override string FreshState(string scenario) => HostProcess.FreshState(scenario);
+
+    protected override IReadOnlyDictionary<string, string>? ProviderEnv(string state) =>
+        new Dictionary<string, string> { ["HISTORY_PROVIDER"] = "sqlite" };
+
+    private static string DatabasePath(string state) => Path.Combine(state, "history.db");
+
+    private static List<string> ReadPayloads(string state)
+    {
+        var payloads = new List<string>();
+        string path = DatabasePath(state);
+        if (!File.Exists(path))
+            return payloads;
+        var builder = new SqliteConnectionStringBuilder
+        {
+            DataSource = path,
+            Mode = SqliteOpenMode.ReadOnly,
+            Pooling = false,
+        };
+        using var conn = new SqliteConnection(builder.ConnectionString);
+        conn.Open();
+        using var exists = new SqliteCommand(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'HistoryEvents'", conn);
+        if ((long)exists.ExecuteScalar()! == 0)
+            return payloads;
+        using var cmd = new SqliteCommand("SELECT Payload FROM HistoryEvents ORDER BY N", conn);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            payloads.Add(reader.GetString(0));
+        return payloads;
+    }
+
+    private static void Execute(string state, string sql)
+    {
+        var builder = new SqliteConnectionStringBuilder
+        {
+            DataSource = DatabasePath(state),
+            Mode = SqliteOpenMode.ReadWrite,
+            Pooling = false,
+        };
+        using var conn = new SqliteConnection(builder.ConnectionString);
+        conn.Open();
+        using var cmd = new SqliteCommand(sql, conn);
+        cmd.ExecuteNonQuery();
+    }
+
+    public override List<JsonElement> History(string state) =>
+        ReadPayloads(state).Select(p => JsonDocument.Parse(p).RootElement.Clone()).ToList();
+
+    public override string HistoryText(string state) => string.Join("\n", ReadPayloads(state));
+
+    public override string CloneState(string state, string suffix) => CopyStateDir(state, suffix);
+
+    public override void DamageHistory(string state, HistoryDamage damage)
+    {
+        switch (damage)
+        {
+            case HistoryDamage.InvalidJsonRecord:
+                Execute(state, "UPDATE HistoryEvents SET Payload = '{this is not valid json' WHERE N = 3");
+                break;
+            case HistoryDamage.DeleteSecondRecord:
+                Execute(state, "DELETE FROM HistoryEvents WHERE N = 2");
+                break;
+            case HistoryDamage.TamperRecordedResult:
+                Execute(state,
+                    "UPDATE HistoryEvents SET Payload = REPLACE(Payload, '\"result\":\"reserved\"', '\"result\":\"tampered\"')");
+                break;
+        }
+    }
+
+    public override void AssertUncommittedWriteDiscarded(string state)
+    {
+        var completions = History(state).Where(e =>
+            e.GetProperty("type").GetString() == "ActivityCompleted" &&
+            e.GetProperty("seq").GetInt64() == 1);
+        Assert.Empty(completions);
+    }
+
+    public override void AssertDiscardSurfaced(string state, HostRun resumeRun)
+    {
+        Assert.DoesNotContain("torn tail", resumeRun.Output);
+        _ = History(state);
     }
 }

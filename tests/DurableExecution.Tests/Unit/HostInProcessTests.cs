@@ -238,3 +238,11 @@ public sealed class HostInProcessTestsFile() : HostInProcessTests(new FileStoreF
 /// <summary>Host tests against the SQL Server provider (§6.5 conformance).</summary>
 [Trait("Provider", "SqlServer")]
 public sealed class HostInProcessTestsSqlServer() : HostInProcessTests(new SqlStoreFactory());
+
+/// <summary>Host tests against the PostgreSQL provider (§6.5 conformance).</summary>
+[Trait("Provider", "PostgreSql")]
+public sealed class HostInProcessTestsPostgreSql() : HostInProcessTests(new PostgresStoreFactory());
+
+/// <summary>Host tests against the SQLite provider (§6.5 conformance).</summary>
+[Trait("Provider", "Sqlite")]
+public sealed class HostInProcessTestsSqlite() : HostInProcessTests(new SqliteStoreFactory());

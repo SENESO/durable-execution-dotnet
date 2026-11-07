@@ -176,3 +176,11 @@ public sealed class ScenarioFanOutTestsFile() : ScenarioFanOutTests(new FileScen
 /// <summary>Fan-out scenarios L–N against the SQL Server provider (§6.5 conformance).</summary>
 [Trait("Provider", "SqlServer")]
 public sealed class ScenarioFanOutTestsSqlServer() : ScenarioFanOutTests(new SqlScenarioProvider());
+
+/// <summary>Fan-out scenarios L–N against the PostgreSQL provider (§6.5 conformance).</summary>
+[Trait("Provider", "PostgreSql")]
+public sealed class ScenarioFanOutTestsPostgreSql() : ScenarioFanOutTests(new PostgresScenarioProvider());
+
+/// <summary>Fan-out scenarios L–N against the SQLite provider (§6.5 conformance).</summary>
+[Trait("Provider", "Sqlite")]
+public sealed class ScenarioFanOutTestsSqlite() : ScenarioFanOutTests(new SqliteScenarioProvider());

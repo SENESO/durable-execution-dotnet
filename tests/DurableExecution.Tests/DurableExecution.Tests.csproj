@@ -22,6 +22,8 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\DurableExecution.Core\DurableExecution.Core.csproj" />
     <ProjectReference Include="..\..\src\DurableExecution.SqlServer\DurableExecution.SqlServer.csproj" />
+    <ProjectReference Include="..\..\src\DurableExecution.PostgreSql\DurableExecution.PostgreSql.csproj" />
+    <ProjectReference Include="..\..\src\DurableExecution.Sqlite\DurableExecution.Sqlite.csproj" />
     <!-- Builds the scenario host executable; the tests drive it as a child
          process. It is not referenced as a library. -->
     <ProjectReference Include="..\DurableExecution.TestHost\DurableExecution.TestHost.csproj">

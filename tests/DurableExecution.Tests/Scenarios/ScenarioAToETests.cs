@@ -154,3 +154,11 @@ public sealed class ScenarioAToETestsFile() : ScenarioAToETests(new FileScenario
 /// <summary>Scenarios A–E against the SQL Server provider (§6.5 conformance).</summary>
 [Trait("Provider", "SqlServer")]
 public sealed class ScenarioAToETestsSqlServer() : ScenarioAToETests(new SqlScenarioProvider());
+
+/// <summary>Scenarios A–E against the PostgreSQL provider (§6.5 conformance).</summary>
+[Trait("Provider", "PostgreSql")]
+public sealed class ScenarioAToETestsPostgreSql() : ScenarioAToETests(new PostgresScenarioProvider());
+
+/// <summary>Scenarios A–E against the SQLite provider (§6.5 conformance).</summary>
+[Trait("Provider", "Sqlite")]
+public sealed class ScenarioAToETestsSqlite() : ScenarioAToETests(new SqliteScenarioProvider());

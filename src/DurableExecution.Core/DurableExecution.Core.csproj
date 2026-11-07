@@ -13,6 +13,8 @@
     <!-- Providers seal records with the same internal checksum the file
          provider uses; the seal is one implementation for every medium. -->
     <InternalsVisibleTo Include="DurableExecution.SqlServer" />
+    <InternalsVisibleTo Include="DurableExecution.PostgreSql" />
+    <InternalsVisibleTo Include="DurableExecution.Sqlite" />
   </ItemGroup>
 
 </Project>

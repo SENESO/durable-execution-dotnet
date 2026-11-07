@@ -6,12 +6,13 @@ not. The evidence rule (§7.2) governs every line: implemented-and-proven
 means the cited suite runs it green from a clean checkout via
 `./run-tests.sh`.
 
-**Latest recorded runs (2026-11-07, after P1's first item): 47 tests,
-47 passed, 0 failed** with `./run-tests.sh` on the file provider alone
-(the P0 evidence, unchanged), and **93 tests, 93 passed, 0 failed** with
-`DE_SQLSERVER_CONNECTION` set against a test SQL Server — the same suite
-run per provider under the §6.5 conformance gate (see the P1 section
-below for the coverage matrix).
+**Latest recorded runs (2026-11-07, after the P1 completion sweep and
+the P2 core): 133 tests, 133 passed, 0 failed** with `./run-tests.sh`
+(the file and SQLite providers — the no-server gate), and **265 tests,
+265 passed, 0 failed** with both `DE_SQLSERVER_CONNECTION` and
+`DE_POSTGRES_CONNECTION` set against test servers — the same suite run
+per provider under the §6.5 conformance gate (see the P1 and P2
+sections below for the coverage matrix).
 
 ## P0 acceptance criteria (Foundation §14) — status
 
@@ -159,20 +160,160 @@ package and driven under a dedicated least-privilege test login
 (`dbcreator` only, so the suite can provision its scratch databases);
 the databases are dropped by the tests, verified empty afterwards.
 
+## P1, remaining items — PostgreSQL provider, SQLite provider, snapshots
+
+Delivered 2026-11-07 under the same §6.5 gate: each provider ships
+because the shared suite runs green against it.
+
+**PostgreSQL** (`src/DurableExecution.PostgreSql`, `PostgresHistoryStore`):
+one instance's history as rows of `public.history_events (instance_id,
+n, payload)` in a caller-provisioned database; the payload is the
+identical sealed record, load runs the identical shared validator, and
+an append is one serializable transaction that re-verifies the end of
+history before inserting. Single-writer is the in-database analogue of
+the SQL Server session lock: a dedicated connection holds
+`pg_try_advisory_lock` on a 64-bit key derived from the SHA-256 of the
+instance's lock resource, from load until dispose, with the same
+2-second grace and the same refusal. Limits, honestly: advisory locks
+are cooperative, the derived key could theoretically collide with an
+unrelated advisory lock in the same database (the append end-check
+still detects a bypassing writer), and nothing here fences writers
+across databases or machines — cross-device fencing stays P3. Evidence:
+the full conformance matrix green against PostgreSQL 16.15 stood up
+locally as a scratch cluster under a dedicated least-privilege login
+(`createdb` only, so the suite can provision its scratch databases);
+the databases are dropped by the tests and the cluster was discarded.
+
+**SQLite** (`src/DurableExecution.Sqlite`, `SqliteHistoryStore`): the
+embedded development provider — one `history.db` file per state
+directory, `HistoryEvents (N, Payload)`, `PRAGMA synchronous = FULL`,
+one transaction per append with the same end-of-history re-verification.
+Single-writer is the file provider's own mechanism: an OS lock file
+held from load to dispose. No server, no environment variable; the
+suite runs it always.
+
+**Snapshots (the remaining P1 item).** Every store now writes a sealed
+snapshot of the workflow's logical state every N appends (default 50;
+configurable per store, 0 disables): the same facts a full replay would
+rebuild — per-command activity, input fingerprint and recorded
+idempotency key, attempt counts, results, workflow result — sealed with
+the same SHA-256 checksum discipline as history records. On the file
+provider the snapshot lands by atomic rename after the append; on the
+database providers it is upserted inside the append's own transaction,
+so a snapshot can never claim events a crash rolled back. Resume loads
+snapshot + tail instead of replaying from event zero. Semantics, chosen
+by the sealing model: a snapshot is sealed data, so a damaged,
+unparseable, or ahead-of-history snapshot is corruption and is refused
+loudly with `HistoryCorruptionException` — there is no silent fallback
+to full replay, for the same reason a damaged history record is refused
+rather than skipped. Equivalence is proven, not asserted: per provider,
+store tests reconstruct a snapshotted history two ways and compare
+event-for-event (roles, keys, results), corrupt-snapshot and
+ahead-of-history refusals are asserted, and two crash scenarios (B: the
+§8.1 window; L: mid-fan-out kill) run with a snapshot forced every 2
+events against a no-snapshot control, asserting identical counters,
+identical recorded keys, identical history shape, and a resume the host
+reports as snapshot-served.
+
+| Evidence | File | SQL Server | PostgreSQL | SQLite |
+|---|---|---|---|---|
+| Scenarios A–E (§7.3 + clean run + mid-write) | 5 | 5 | 5 | 5 |
+| Scenarios F–K (corruption, determinism, loop, ownership) | 8 | 8 | 8 | 8 |
+| Fan-out scenarios L–N | 3 | 3 | 3 | 3 |
+| Store conformance contract (append/load, corruption rules) | 10 | 10 | 10 | 10 |
+| Host unit tests | 8 | 8 | 8 | 8 |
+| Fan-out unit tests | 8 | 8 | 8 | 8 |
+| Snapshot store tests (equivalence, corruption, ahead-of-history) | 3 | 3 | 3 | 3 |
+| Snapshot scenario equivalence (B and L, snapshots forced) | 2 | 2 | 2 | 2 |
+| SQL-provider-specific (session lock, instance isolation) | — | 4 | — | — |
+| File-framing only (torn tail truncation/report) | 1 | — | — | — |
+| Keys and fingerprints (provider-agnostic) | 4 | — | — | — |
+| **Totals** | **52** | **51** | **47** | **47** |
+
+One honest note on the snapshot scenario equivalence for L: fan-out
+branches race, so the comparison is over the deterministic content —
+schedules, keys, completions, results — as a multiset; attempt records
+are excluded because how many attempts the in-flight branch needed is a
+property of the clock, and branches 1 and 3 may each execute once or
+twice depending on whether the kill caught them in flight. What may
+never vary, and is asserted per run: branch 2 executes exactly twice,
+and exactly one charge per branch is applied.
+
+## P2 core — retry policies, durable timers, signals
+
+Delivered 2026-11-07, in the roadmap's order, each gated on the same
+per-provider suite.
+
+**Retry policies.** A call may carry a `RetryPolicy` (max attempts,
+initial delay, backoff multiplier, optional cap). A failed attempt is
+recorded (`ActivityAttemptFailed`: command, attempt, error) before the
+backoff wait, so the budget is durable: a host that dies between
+attempts resumes with the recorded failure count, and a command whose
+recorded failures reach the maximum is exhausted — resuming re-throws
+`ActivityFailedException` without executing again. An attempt
+interrupted by a crash consumes no budget (it never finished, exactly
+as it is not a completion). Backoff is a pure function of the failure
+count — no jitter — and waits run on the new `IWorkflowClock` seam.
+Without a policy, behaviour is unchanged from P0, asserted by test.
+Evidence per provider: unit tests (flaky-then-succeeds with the fake
+clock asserting the [100ms, 200ms] schedule and one key across
+attempts; durable exhaustion across a resume; no-policy regression)
+and scenario O across real process kills, including a kill between
+attempts after which the resume spends exactly the remaining budget.
+
+**Durable timers.** `DelayAsync` takes a command position.
+`TimerScheduled` records the due time and requested duration before
+the wait begins; the wait runs against the recorded due time, so a
+host that dies mid-wait resumes waiting only for the remainder, and
+`TimerFired` closes the timer. A changed duration at the recorded
+position is a determinism violation. Evidence per provider: manual-
+clock unit tests (fires at the recorded due time, not before; death
+mid-wait; violation; zero duration) and scenario P — a real-clock 3s
+timer killed ~0.4s into the wait, proven from the workflow's own
+wall-clock marks to fire at the original due time on resume.
+
+**Signals.** `WaitForSignalAsync` waits for an external signal;
+`SignalReceived` is appended to history before delivery, always — the
+host's `SendSignal` appends inside the append gate and only then
+wakes a waiter, and a signal appended to the store while no host ran
+is delivered from history on the next run. Consumption is per name,
+oldest first. Named limit: live delivery to a *running* host is an
+in-process call on that host; a cross-process sender appends while no
+host runs (the single-writer lock is the boundary) — there is no
+cross-process live push in this stage. Evidence per provider: unit
+tests (recorded-before-delivered ordering in history, payload-driven
+effect, pre-run delivery, per-name ordering, no-active-run refusal)
+and scenario Q — killed while waiting, signal recorded by a separate
+sender process while dead, resume charges exactly the approved
+amount exactly once.
+
+Updated totals (the P1 matrix plus P2):
+
+| Evidence | File | SQL Server | PostgreSQL | SQLite |
+|---|---|---|---|---|
+| P1 matrix (scenarios A–N, contract, host, fan-out, snapshots, provider-specific, keys) | 52 | 51 | 47 | 47 |
+| Retry unit tests | 4 | 4 | 4 | 4 |
+| Scenario O (retries, incl. kill between attempts) | 2 | 2 | 2 | 2 |
+| Timer unit tests (manual clock) | 4 | 4 | 4 | 4 |
+| Scenario P (timer, kill while waiting, real clock) | 2 | 2 | 2 | 2 |
+| Signal unit tests | 4 | 4 | 4 | 4 |
+| Scenario Q (signal, killed while waiting) | 1 | 1 | 1 | 1 |
+| **Totals** | **69** | **68** | **64** | **64** |
+
 ## Foundation sections → implemented / not yet
 
 | Foundation | State in P0 |
 |---|---|
 | §2 Guarantee contract | Normative in README + code docs; enforced by scenarios B and E (both gateway modes asserted) |
-| §4 Architecture / stage A | Library core present: orchestrator context, checkpoint-by-append, recovery by replay. The `IHistoryStore` seam has two conformance-proven providers (file, SQL Server); stage B/C remain interfaces only |
-| §5.3 Execution model (P0 subset) | Sequential durable awaits, recorded-result replay, and the `WhenAll` fan-out implemented (`CallAllAsync`): branches are scheduled synchronously in list order — per-branch activity identity, input fingerprint and ADR-012 key settled before any branch executes — then run concurrently, each completion recorded as it lands, results combined in schedule order regardless of completion order; proven by scenarios L/M/N and the fan-out unit tests. P0 form keeps the activity body with the call; name→registry resolution and the §5.1 two-argument surface are not built. Roslyn analyzers (ADR-006, Proposed) not built; replay validation is the active enforcement layer |
-| §6.1 Event model | Schema v1 emits the P0 subset: `WorkflowStarted`, `ActivityScheduled`, `ActivityAttemptStarted`, `ActivityCompleted`, `WorkflowCompleted`. Remaining §6.1 types are reserved for their phases. Payload separation/encryption (ADR-014/017) not built — payloads currently sit inside completion records |
-| §6.2 Checkpoint atomicity | Append+fsync per event against the file provider; one serializable transaction per append against the SQL Server provider (P1) |
+| §4 Architecture / stage A | Library core present: orchestrator context, checkpoint-by-append, recovery by replay. The `IHistoryStore` seam has four conformance-proven providers (file, SQL Server, PostgreSQL, SQLite); stage B/C remain interfaces only |
+| §5.3 Execution model (P0 subset) | Sequential durable awaits, recorded-result replay, and the `WhenAll` fan-out implemented (`CallAllAsync`): branches are scheduled synchronously in list order — per-branch activity identity, input fingerprint and ADR-012 key settled before any branch executes — then run concurrently, each completion recorded as it lands, results combined in schedule order regardless of completion order; proven by scenarios L/M/N and the fan-out unit tests. P2 added the durable-wait mechanisms on the same command model: retry policies (per call or per fan-out branch), durable timers, and signals — see the P2 section. P0 form keeps the activity body with the call; name→registry resolution and the §5.1 two-argument surface are not built. Roslyn analyzers (ADR-006, Proposed) not built; replay validation is the active enforcement layer |
+| §6.1 Event model | Schema v1 emits: `WorkflowStarted`, `ActivityScheduled`, `ActivityAttemptStarted`, `ActivityAttemptFailed` (P2 retries), `ActivityCompleted`, `WorkflowCompleted`, `TimerScheduled`, `TimerFired` (P2 timers), `SignalReceived` (P2 signals). Remaining §6.1 types are reserved for their phases. Payload separation/encryption (ADR-014/017) not built — payloads currently sit inside completion records |
+| §6.2 Checkpoint atomicity | Append+fsync per event against the file provider; one serializable transaction per append against the database providers (P1). Snapshots ride the same atomicity: atomic rename on the file provider, the append's own transaction on the database providers |
 | §6.3 Deterministic replay & validation | Implemented and asserted (see mapping above) |
-| §6.5 Provider conformance | Implemented with P1's first item: one suite, executed per provider (file + SQL Server), 93 tests green with both — see the P1 section for the matrix and the named adaptations |
-| §7 Fault testing | Harness present in minimal P0 form (fixed kill points), now across both providers. Seeded randomized kill-point scheduling is P1 harness growth, not yet built |
+| §6.5 Provider conformance | One suite, executed per provider (file, SQL Server, PostgreSQL, SQLite), 265 tests green with all four — see the P1 and P2 sections for the matrices and the named adaptations |
+| §7 Fault testing | Harness present (fixed kill points across all four providers), extended by P2 with the between-attempts kill (O), the kill-while-waiting (P, Q). Seeded randomized kill-point scheduling is harness growth, not yet built |
 | §8 Idempotency & side effects | Stable keys + propagation via `ActivityContext` implemented. Side-effect classes, engine-managed transactional path, outbox, dedup helper, reconciliation *hooks* (`IReconciliationCheck`) are not built — reconciliation exists as the harness's resumable command (scenario E), not yet as a runtime API. §8.5 key-retention window policy is design only |
-| §9 Leases/fencing (stage B) | Not built. Single-writer OS lock (scenario K); the SQL provider adds the in-database analogue (session application lock, cooperative — see P1 section). Cross-machine fencing is P3 |
+| §9 Leases/fencing (stage B) | Not built. Single-writer OS lock (scenario K); the database providers add the in-database analogues (SQL Server session application lock, PostgreSQL advisory lock — cooperative, see P1 sections). Cross-machine fencing is P3 |
 | §10 Versioning | Detection-and-halt only (safe failure). Version gates and golden-history corpus are P4 |
 | §11 Dashboard / OTEL | Not built (P5) |
 | §12 Tenancy/security | Namespace id is carried in key derivation and shaped in the schema (ADR-010); single-namespace runtime. Isolation suite, payload encryption, crypto-erasure: not built |
@@ -198,10 +339,6 @@ the P1 section above.
 
 ## Named gaps — untouched by design
 
-- PostgreSQL and SQLite providers (later P1 items; each ships only
-  through the same §6.5 gate).
-- Snapshots (P1): history is still replayed in full; the SQL provider
-  does not change that.
 - Seeded randomized kill-point scheduling (§7 harness growth, P1).
 - Real power loss: process kills are not power cuts; fsync-per-append and
   atomic renames are the strongest claims made, and directory-entry
@@ -211,6 +348,5 @@ the P1 section above.
   histories are P4.
 - Gateway idempotency-key expiry (§8.5 retention window): policy documented
   in the foundation; no expiring-key stub or routing behaviour is built.
-- Cross-device fencing: single-machine OS lock and the SQL provider's
-  cooperative in-database lock only; lease fencing is P3.
-- Timers, signals, retries: P2 by the roadmap — explicitly out of P0 scope.
+- Cross-device fencing: single-machine OS lock and the database
+  providers' cooperative in-database locks only; lease fencing is P3.

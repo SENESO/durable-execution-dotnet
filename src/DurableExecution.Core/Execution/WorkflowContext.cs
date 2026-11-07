@@ -24,16 +24,26 @@ public sealed class WorkflowContext
     private readonly string _instanceId;
     private readonly IHistoryStore _store;
     private readonly List<HistoryEvent> _history;
+    private readonly IWorkflowClock _clock;
     private readonly object _appendGate = new();
+    private readonly List<HistoryEvent> _signals = new();
+    private readonly Dictionary<string, int> _signalConsumption = new();
+    private readonly Dictionary<string, TaskCompletionSource> _signalWaiters = new();
     private long _commandSequence;
 
-    internal WorkflowContext(string namespaceId, string instanceId, IHistoryStore store, List<HistoryEvent> history)
+    internal WorkflowContext(string namespaceId, string instanceId, IHistoryStore store, List<HistoryEvent> history,
+        IWorkflowClock? clock = null)
     {
         _namespaceId = namespaceId;
         _instanceId = instanceId;
         _store = store;
         _history = history;
+        _clock = clock ?? SystemWorkflowClock.Instance;
+        _signals.AddRange(history.Where(e => e.Type == HistoryEventTypes.SignalReceived));
     }
+
+    /// <summary>The engine clock this context waits on (retry backoff, timers).</summary>
+    internal IWorkflowClock Clock => _clock;
 
     public string InstanceId => _instanceId;
 
@@ -44,12 +54,124 @@ public sealed class WorkflowContext
     /// a crash between execution and recording means it will execute again
     /// on recovery, carrying the same idempotency key).
     /// </summary>
-    public async Task<T> CallActivityAsync<T>(string activity, object? input, Func<ActivityContext, Task<T>> body)
+    public async Task<T> CallActivityAsync<T>(string activity, object? input, Func<ActivityContext, Task<T>> body,
+        RetryPolicy? retryPolicy = null)
     {
         var slot = ScheduleOrValidate(activity, input);
         if (slot.Completed is not null)
             return slot.Completed.GetResult<T>()!;
-        return await ExecuteAsync(slot, activity, body);
+        return await ExecuteAsync(slot, activity, body, retryPolicy);
+    }
+
+    /// <summary>
+    /// A durable timer (P2): waits until a due time that is recorded in
+    /// history before the wait begins. The first time the position is
+    /// reached, <c>TimerScheduled</c> settles the due time (engine clock +
+    /// duration) and the requested duration; the wait then runs against
+    /// the recorded due time, so a host that dies mid-wait resumes waiting
+    /// only for the remainder — the timer fires at its original due time,
+    /// not a fresh delay after the restart. <c>TimerFired</c> is recorded
+    /// when the wait completes; a replay that finds it returns at once.
+    /// Asking the recorded position for a different duration is a
+    /// determinism violation, like changing an activity's input.
+    /// </summary>
+    public async Task DelayAsync(TimeSpan duration, CancellationToken cancellationToken = default)
+    {
+        if (duration < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(duration), "timer duration cannot be negative");
+        long seq = ++_commandSequence;
+
+        var scheduled = _history.FirstOrDefault(e =>
+            e.Type == HistoryEventTypes.TimerScheduled && e.CommandSequence == seq);
+        DateTimeOffset dueAt;
+        if (scheduled is not null)
+        {
+            if (scheduled.GetInt64("durationMs") != (long)duration.TotalMilliseconds)
+                throw new NonDeterminismViolationException(
+                    $"timer at command {seq} was recorded with duration {scheduled.GetInt64("durationMs")}ms " +
+                    $"but the code now requests {(long)duration.TotalMilliseconds}ms");
+            dueAt = DateTimeOffset.Parse(scheduled.GetString("dueAt")!);
+        }
+        else
+        {
+            if (_history.Any(e => e.Type == HistoryEventTypes.ActivityScheduled && e.CommandSequence == seq))
+                throw new NonDeterminismViolationException(
+                    $"command {seq} was recorded as an activity but the code now requests a timer there");
+            dueAt = _clock.UtcNow + duration;
+            Append(HistoryEvent.TimerScheduled(_instanceId, seq, dueAt, (long)duration.TotalMilliseconds));
+        }
+
+        if (_history.Any(e => e.Type == HistoryEventTypes.TimerFired && e.CommandSequence == seq))
+            return;
+
+        TimeSpan remaining = dueAt - _clock.UtcNow;
+        if (remaining > TimeSpan.Zero)
+            await _clock.Delay(remaining, cancellationToken);
+        Append(HistoryEvent.TimerFired(_instanceId, seq));
+    }
+
+    /// <summary>
+    /// Waits for an external signal (P2). Signals are recorded in history
+    /// (<c>SignalReceived</c>) <b>before</b> they are delivered — a signal
+    /// is never visible to the workflow before it is durable. Delivery
+    /// consumes signals per name, in recorded order: the oldest
+    /// unconsumed signal with the requested name is returned; signals for
+    /// other names are untouched. A signal recorded before the run started
+    /// (appended to the store while no host ran) is delivered from history
+    /// exactly like one delivered live through the host. Waits take no
+    /// command position — signals are external input, and their recorded
+    /// order is what makes consumption deterministic across replays.
+    /// </summary>
+    public async Task<T> WaitForSignalAsync<T>(string name, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        while (true)
+        {
+            TaskCompletionSource waiter;
+            lock (_appendGate)
+            {
+                if (TryConsumeLocked<T>(name, out var payload))
+                    return payload!;
+                if (!_signalWaiters.TryGetValue(name, out var existing))
+                {
+                    existing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _signalWaiters[name] = existing;
+                }
+                waiter = existing;
+            }
+            await waiter.Task.WaitAsync(cancellationToken);
+        }
+    }
+
+    private bool TryConsumeLocked<T>(string name, out T? payload)
+    {
+        int consumed = _signalConsumption.GetValueOrDefault(name);
+        var matches = _signals.Where(e => e.GetString("name") == name).ToList();
+        if (consumed < matches.Count)
+        {
+            _signalConsumption[name] = consumed + 1;
+            payload = matches[consumed].GetResult<T>();
+            return true;
+        }
+        payload = default;
+        return false;
+    }
+
+    /// <summary>
+    /// Records a signal in history and only then wakes a matching waiter —
+    /// the recorded-before-delivered rule, enforced by ordering inside the
+    /// append gate. Called by the host while a run is active.
+    /// </summary>
+    internal void DeliverSignal(string name, object? payload)
+    {
+        TaskCompletionSource? waiter;
+        lock (_appendGate)
+        {
+            var framed = AppendLocked(HistoryEvent.SignalReceived(_instanceId, name, payload));
+            _signals.Add(framed);
+            _signalWaiters.Remove(name, out waiter);
+        }
+        waiter?.TrySetResult();
     }
 
     /// <summary>
@@ -108,7 +230,7 @@ public sealed class WorkflowContext
             {
                 try
                 {
-                    results[branch] = await ExecuteAsync(slots[branch], calls[branch].Activity, calls[branch].Body);
+                    results[branch] = await ExecuteAsync(slots[branch], calls[branch].Activity, calls[branch].Body, calls[branch].RetryPolicy);
                 }
                 catch (Exception e)
                 {
@@ -185,26 +307,55 @@ public sealed class WorkflowContext
     }
 
     /// <summary>
-    /// Executes one scheduled command: records the attempt (numbered under
-    /// the append gate, so concurrent branches can never interleave attempt
-    /// numbers), runs the body with the command's recorded key, and records
-    /// the completion. A throw from the body leaves the attempt unrecorded-
-    /// complete — the at-least-once window, identical to the sequential path.
+    /// Executes one scheduled command. Without a retry policy this is the
+    /// P0 shape: record the attempt, run the body, record the completion;
+    /// a throw leaves the attempt unrecorded-complete (the at-least-once
+    /// window). With a policy, a failed attempt is recorded as failed
+    /// (<c>ActivityAttemptFailed</c>) before the backoff wait, so the
+    /// budget survives the host: a crash between attempts resumes with the
+    /// recorded failure count, and a command whose recorded failures reach
+    /// the policy's maximum is exhausted — it throws
+    /// <see cref="ActivityFailedException"/> without executing again,
+    /// on the first run and on every resume alike.
     /// </summary>
-    private async Task<T> ExecuteAsync<T>(CommandSlot slot, string activity, Func<ActivityContext, Task<T>> body)
+    private async Task<T> ExecuteAsync<T>(CommandSlot slot, string activity, Func<ActivityContext, Task<T>> body,
+        RetryPolicy? retryPolicy)
     {
-        long attempt;
-        lock (_appendGate)
+        long RecordedFailures() => _history.Count(e =>
+            e.Type == HistoryEventTypes.ActivityAttemptFailed && e.CommandSequence == slot.Sequence);
+
+        if (retryPolicy is not null && RecordedFailures() >= retryPolicy.MaxAttempts)
+            throw new ActivityFailedException(activity, (int)RecordedFailures(), null);
+
+        while (true)
         {
-            attempt = _history.Count(e =>
-                e.Type == HistoryEventTypes.ActivityAttemptStarted && e.CommandSequence == slot.Sequence) + 1;
-            AppendLocked(HistoryEvent.ActivityAttemptStarted(_instanceId, slot.Sequence, attempt));
+            long attempt;
+            lock (_appendGate)
+            {
+                attempt = _history.Count(e =>
+                    e.Type == HistoryEventTypes.ActivityAttemptStarted && e.CommandSequence == slot.Sequence) + 1;
+                AppendLocked(HistoryEvent.ActivityAttemptStarted(_instanceId, slot.Sequence, attempt));
+            }
+
+            T result;
+            try
+            {
+                result = await body(new ActivityContext(slot.Sequence, activity, slot.IdempotencyKey, attempt));
+            }
+            catch (Exception ex) when (retryPolicy is not null && ex is not OperationCanceledException)
+            {
+                Append(HistoryEvent.ActivityAttemptFailed(
+                    _instanceId, slot.Sequence, attempt, $"{ex.GetType().Name}: {ex.Message}"));
+                long failures = RecordedFailures();
+                if (failures >= retryPolicy.MaxAttempts)
+                    throw new ActivityFailedException(activity, (int)failures, ex);
+                await _clock.Delay(retryPolicy.DelayAfterFailedAttempt((int)failures));
+                continue;
+            }
+
+            Append(HistoryEvent.ActivityCompleted(_instanceId, slot.Sequence, activity, result));
+            return result;
         }
-
-        T result = await body(new ActivityContext(slot.Sequence, activity, slot.IdempotencyKey, attempt));
-
-        Append(HistoryEvent.ActivityCompleted(_instanceId, slot.Sequence, activity, result));
-        return result;
     }
 
     private void Append(HistoryEvent historyEvent)
@@ -213,13 +364,15 @@ public sealed class WorkflowContext
             AppendLocked(historyEvent);
     }
 
-    private void AppendLocked(HistoryEvent historyEvent)
+    private HistoryEvent AppendLocked(HistoryEvent historyEvent)
     {
         // Keep the in-memory view in step with the store: the framed event the
         // store recorded is the one replay consults for the rest of this run.
         // The store itself is single-threaded (event sequences are assigned at
         // append time), so every append — sequential or fan-out — is
         // serialized through this gate.
-        _history.Add(_store.Append(historyEvent));
+        var framed = _store.Append(historyEvent);
+        _history.Add(framed);
+        return framed;
     }
 }

@@ -1,6 +1,9 @@
 using DurableExecution.History;
+using DurableExecution.PostgreSql;
+using DurableExecution.Sqlite;
 using DurableExecution.SqlServer;
 using Microsoft.Data.SqlClient;
+using Npgsql;
 
 namespace DurableExecution.Tests.Unit;
 
@@ -39,4 +42,31 @@ public sealed class SqlStoreFactory : IStoreFactory
         try { SqlTestDatabases.DropDatabase(_database.Name); }
         catch (SqlException) { /* best-effort cleanup of a scratch database */ }
     }
+}
+
+
+/// <summary>
+/// The PostgreSQL provider's factory: one scratch database per test class,
+/// dropped on dispose. Requires <c>DE_POSTGRES_CONNECTION</c>; trait-excluded
+/// when it is absent.
+/// </summary>
+public sealed class PostgresStoreFactory : IStoreFactory
+{
+    private readonly (string Name, string Connection) _database = PostgresTestDatabases.CreateDatabase("unit");
+
+    public IHistoryStore CreateStore(string stateDir) => new PostgresHistoryStore(_database.Connection, "order-1001");
+
+    public void Dispose()
+    {
+        try { PostgresTestDatabases.DropDatabase(_database.Name); }
+        catch (NpgsqlException) { /* best-effort cleanup of a scratch database */ }
+    }
+}
+
+/// <summary>The SQLite provider's factory: a store over the test's state directory.</summary>
+public sealed class SqliteStoreFactory : IStoreFactory
+{
+    public IHistoryStore CreateStore(string stateDir) => new SqliteHistoryStore(stateDir);
+
+    public void Dispose() { }
 }

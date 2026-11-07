@@ -11,8 +11,10 @@ if the host crashes or restarts, the process resumes from its recorded
 history instead of starting over or stopping half-done.
 
 This repository is **stage A (the embeddable library)**: the durable
-execution core (phase P0), plus P1's first item — the SQL Server history
-provider, admitted through the §6.5 conformance gate. It is built under one
+execution core (phase P0), plus the P1 provider and snapshot work — four
+history providers (file, SQL Server, PostgreSQL, SQLite) and sealed
+history snapshots — and the P2 core: activity retry policies, durable
+timers, and signals, each admitted through the §6.5 conformance gate. It is built under one
 governing rule, taken from the Engineering Foundation (§7.2): **no phase
 advances on "the code works" — a phase advances only on reproducible test
 evidence.** The evidence command is `./run-tests.sh`; the current results
@@ -84,6 +86,20 @@ substance because every other claim in this repository is bounded by it.
 - **Crash-safe auxiliary writes**: atomic file replacement (temporary file +
   fsync + rename) for counters and ledgers, and a single-writer OS lock per
   instance state — a second host is refused.
+- **Retries, timers, signals (P2)**: a call may carry a `RetryPolicy` —
+  failed attempts are recorded in history before the backoff wait (which
+  runs on an injectable engine clock), so the retry budget survives the
+  host and exhaustion is durable. `DelayAsync` is a durable timer: its
+  due time is recorded before the wait, so a restarted host waits only
+  the remainder and fires at the original due time. `WaitForSignalAsync`
+  receives external signals that are appended to history before they are
+  delivered, and consumed per name, in recorded order.
+- **Sealed snapshots**: every store periodically snapshots the workflow's
+  logical state (same SHA-256 sealing discipline as history itself), so
+  resume replays snapshot + tail instead of event zero. A damaged snapshot
+  is corruption and is refused loudly — never silently bypassed; the suite
+  proves snapshot + tail reconstruction identical to full replay, per
+  provider.
 - **The crash-injection suite** (§7): a scriptable payment-gateway stub in
   idempotent and non-idempotent modes, a resumable reconciliation command,
   and 11 scenarios (A–K) executed across real process kills, plus three
@@ -100,8 +116,10 @@ await ctx.CallActivityAsync("ReserveStock", input.OrderId);
 return OrderResult.Completed;
 ```
 
-No timers, no signals, no retries in P0 — by the roadmap's definition, not
-by omission.
+The reference workflow stays minimal by design; the P2 mechanisms
+(retry policies, durable timers, signals) are exercised by their own
+scenarios (O, P, Q) and unit suites rather than by the reference
+workflow.
 
 ## Layout
 
@@ -111,18 +129,22 @@ src/DurableExecution.Core/        the library (stage A core)
   Execution/                      host, workflow context, identity, fingerprints
   IO/                             atomic durable file writes
 src/DurableExecution.SqlServer/   SQL Server history provider (P1)
+src/DurableExecution.PostgreSql/  PostgreSQL history provider (P1)
+src/DurableExecution.Sqlite/      SQLite history provider (P1)
 tests/DurableExecution.TestHost/  scenario host process the suite kills/restarts
-tests/DurableExecution.Tests/     xUnit: Scenarios (A–K, fan-out L–N) + Unit (store, keys, host, fan-out), each run per provider
+tests/DurableExecution.Tests/     xUnit: Scenarios (A–K, fan-out L–N) + Unit (store, keys, host, fan-out, snapshots), each run per provider
 ```
 
 `IHistoryStore` is the seam the distributed runtime (stage B) and the
 database providers consume; every provider must pass the shared conformance
-contract (Foundation §6.5) before it may ship. The SQL Server provider
-stores the identical sealed records as rows in a caller-provisioned
-database — one serializable transaction per append, and an exclusive
-session application lock as the single-writer mechanism inside the
-database (cooperative, within one database; cross-device fencing remains
-a later phase and is not claimed).
+contract (Foundation §6.5) before it may ship. The database providers store
+the identical sealed records as rows in a caller-provisioned database —
+one serializable transaction per append, and an in-database lock as the
+single-writer mechanism (SQL Server session application lock, PostgreSQL
+advisory lock — cooperative, within one database; cross-device fencing
+remains a later phase and is not claimed). The SQLite provider is the
+embedded form: one database file per state directory, an OS lock file as
+its single-writer mechanism.
 
 ## Running the tests
 
@@ -131,18 +153,19 @@ a later phase and is not claimed).
 ```
 
 Builds the solution in Release and runs the whole suite from a clean
-checkout. The suite runs per provider: the file provider always, and the
-SQL Server provider too when `DE_SQLSERVER_CONNECTION` names a test SQL
-Server (the suite provisions and drops one scratch database per test; no
+checkout. The suite runs per provider: the file and SQLite providers
+always, and the SQL Server / PostgreSQL providers too when
+`DE_SQLSERVER_CONNECTION` / `DE_POSTGRES_CONNECTION` name a test server
+(the suite provisions and drops one scratch database per test; no
 connection string lives in the repository). Latest recorded results
-(2026-11-07): **47 passed, 0 failed** on the file provider alone, and
-**93 passed, 0 failed** with both providers — see STATUS.md for the
-breakdown, the scenario mapping, and the conformance matrix.
+(2026-11-07): **133 passed, 0 failed** with the no-server gate (file +
+SQLite), and **265 passed, 0 failed** with all four providers — see
+STATUS.md for the breakdown, the scenario mapping, and the conformance
+matrix.
 
 ## Not yet here
 
-PostgreSQL / SQLite providers, snapshots, timers, retries, signals,
-distributed leases and fencing, version gates, payload encryption and
+Distributed leases and fencing, version gates, payload encryption and
 crypto-erasure, the dashboard. Each is a named phase or a named gap with its
 acceptance criteria in the Engineering Foundation; STATUS.md tracks them
 individually. Nothing in this list is claimed by this code.

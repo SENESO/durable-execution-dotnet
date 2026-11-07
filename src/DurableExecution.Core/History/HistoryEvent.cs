@@ -6,21 +6,26 @@ namespace DurableExecution.History;
 /// <summary>
 /// Event type names of schema v1 (foundation §6.1, ADR-014). P0 emits the
 /// subset its mechanisms produce; the remaining §6.1 types (timers, signals,
-/// retries, sub-workflows, version markers) are reserved and land with the
-/// phases that build those mechanisms. Events are never updated or deleted.
+/// sub-workflows, version markers) are reserved and land with the phases
+/// that build those mechanisms. Events are never updated or deleted.
 /// </summary>
 public static class HistoryEventTypes
 {
     public const string WorkflowStarted = "WorkflowStarted";
     public const string ActivityScheduled = "ActivityScheduled";
     public const string ActivityAttemptStarted = "ActivityAttemptStarted";
+    public const string ActivityAttemptFailed = "ActivityAttemptFailed";
+    public const string TimerScheduled = "TimerScheduled";
+    public const string TimerFired = "TimerFired";
+    public const string SignalReceived = "SignalReceived";
     public const string ActivityCompleted = "ActivityCompleted";
     public const string WorkflowCompleted = "WorkflowCompleted";
 
     internal static readonly HashSet<string> Known = new()
     {
         WorkflowStarted, ActivityScheduled, ActivityAttemptStarted,
-        ActivityCompleted, WorkflowCompleted,
+        ActivityAttemptFailed, ActivityCompleted, WorkflowCompleted,
+        TimerScheduled, TimerFired, SignalReceived,
     };
 }
 
@@ -100,12 +105,41 @@ public sealed class HistoryEvent
             f["attempt"] = attempt;
         });
 
+    public static HistoryEvent ActivityAttemptFailed(string instanceId, long commandSequence, long attempt, string error) =>
+        Create(HistoryEventTypes.ActivityAttemptFailed, instanceId, f =>
+        {
+            f["seq"] = commandSequence;
+            f["attempt"] = attempt;
+            f["error"] = error;
+        });
+
     public static HistoryEvent ActivityCompleted(string instanceId, long commandSequence, string activity, object? result) =>
         Create(HistoryEventTypes.ActivityCompleted, instanceId, f =>
         {
             f["seq"] = commandSequence;
             f["activity"] = activity;
             f["result"] = JsonSerializer.SerializeToNode(result);
+        });
+
+    public static HistoryEvent TimerScheduled(string instanceId, long commandSequence, DateTimeOffset dueAt, long durationMs) =>
+        Create(HistoryEventTypes.TimerScheduled, instanceId, f =>
+        {
+            f["seq"] = commandSequence;
+            f["dueAt"] = dueAt.ToString("o");
+            f["durationMs"] = durationMs;
+        });
+
+    public static HistoryEvent TimerFired(string instanceId, long commandSequence) =>
+        Create(HistoryEventTypes.TimerFired, instanceId, f =>
+        {
+            f["seq"] = commandSequence;
+        });
+
+    public static HistoryEvent SignalReceived(string instanceId, string name, object? payload) =>
+        Create(HistoryEventTypes.SignalReceived, instanceId, f =>
+        {
+            f["name"] = name;
+            f["result"] = System.Text.Json.JsonSerializer.SerializeToNode(payload);
         });
 
     public static HistoryEvent WorkflowCompleted(string instanceId, object? result) =>

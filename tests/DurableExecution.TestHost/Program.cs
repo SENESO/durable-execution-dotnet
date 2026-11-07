@@ -1,6 +1,8 @@
 using DurableExecution.Execution;
 using DurableExecution.History;
 using DurableExecution.IO;
+using DurableExecution.PostgreSql;
+using DurableExecution.Sqlite;
 using DurableExecution.SqlServer;
 
 namespace DurableExecution.TestHost;
@@ -35,6 +37,8 @@ public static class Program
         int amount = int.TryParse(Environment.GetEnvironmentVariable("AMOUNT"), out var amt) ? amt : 1000;
         string[] loopItems = (Environment.GetEnvironmentVariable("ITEMS") ?? "a,b,c").Split(',');
         int holdSeconds = int.TryParse(Environment.GetEnvironmentVariable("HOLD_SECONDS"), out var hs) ? hs : 0;
+        int snapshotInterval = int.TryParse(Environment.GetEnvironmentVariable("SNAPSHOT_INTERVAL"), out var si)
+            ? si : FileHistoryStore.DefaultSnapshotInterval;
 
         try
         {
@@ -45,17 +49,42 @@ public static class Program
             // is identical, so a scenario's evidence differs only in the
             // persistence medium it claims to cover.
             IHistoryStore store;
-            if ((Environment.GetEnvironmentVariable("HISTORY_PROVIDER") ?? "file") == "sqlserver")
+            string historyProvider = Environment.GetEnvironmentVariable("HISTORY_PROVIDER") ?? "file";
+            if (historyProvider == "sqlserver")
             {
                 string connection = Environment.GetEnvironmentVariable("HISTORY_SQLSERVER_CONNECTION")
                     ?? throw new InvalidOperationException(
                         "HISTORY_SQLSERVER_CONNECTION is required for the sqlserver provider");
-                store = new SqlHistoryStore(connection, instanceId, new TornWriteInjector());
+                store = new SqlHistoryStore(connection, instanceId, new TornWriteInjector(), snapshotInterval);
+            }
+            else if (historyProvider == "postgresql")
+            {
+                string connection = Environment.GetEnvironmentVariable("HISTORY_POSTGRES_CONNECTION")
+                    ?? throw new InvalidOperationException(
+                        "HISTORY_POSTGRES_CONNECTION is required for the postgresql provider");
+                store = new PostgresHistoryStore(connection, instanceId, new TornWriteInjector(), snapshotInterval);
+            }
+            else if (historyProvider == "sqlite")
+            {
+                store = new SqliteHistoryStore(stateDir, new TornWriteInjector(), snapshotInterval);
             }
             else
             {
-                store = new FileHistoryStore(stateDir, new TornWriteInjector());
+                store = new FileHistoryStore(stateDir, new TornWriteInjector(), snapshotInterval);
             }
+            if (args.Contains("send-signal"))
+            {
+                // An external sender, in its own process, while no host
+                // runs: the signal goes straight into history through the
+                // store (the single-writer lock is free). It will be
+                // delivered from history when the workflow next waits.
+                store.Load();
+                store.Append(HistoryEvent.SignalReceived(instanceId, "approve", amount));
+                (store as IDisposable)?.Dispose();
+                Console.WriteLine($"[signal] recorded 'approve' (payload {amount}) in history");
+                return 0;
+            }
+
             using var host = new WorkflowHost(store, stateDir);
 
             if (holdSeconds > 0)
@@ -70,6 +99,26 @@ public static class Program
 
             if (args.Contains("reconcile"))
                 return Reconcile(stateDir, counters, gateway);
+
+            if (_crashMode == "timer-kill-while-waiting")
+            {
+                // The timer scenario's kill point is inside the engine's
+                // wait, where no workflow code runs to fire it — a watchdog
+                // stands in for the machine dying mid-wait. The kill is
+                // keyed to the workflow's start mark (appended immediately
+                // before the timer is scheduled) plus a short margin, NOT
+                // to a fixed delay after process start: provider startup
+                // times differ, and a wall-clock kill can land before the
+                // timer is even scheduled, which is a different scenario.
+                _ = Task.Run(async () =>
+                {
+                    string mark = Path.Combine(stateDir, "timer.log");
+                    while (!File.Exists(mark))
+                        await Task.Delay(25);
+                    await Task.Delay(250);
+                    HardKill("timer: kill while the workflow waits on a durable timer");
+                });
+            }
 
             return await RunWorkflow(host, counters, gateway, variant, instanceId, amount, loopItems);
         }
@@ -123,7 +172,7 @@ public static class Program
         WorkflowHost host, Counters counters, StubGateway gateway,
         string variant, string instanceId, int amount, string[] loopItems)
     {
-        string definitionId = variant switch { "v2" => "order/v2", "loop" => "loop/v1", "fanout" => "fanout/v1", _ => "order/v1" };
+        string definitionId = variant switch { "v2" => "order/v2", "loop" => "loop/v1", "fanout" => "fanout/v1", "retry" => "retry/v1", "timer" => "timer/v1", "signal" => "signal/v1", _ => "order/v1" };
         object workflowInput = variant == "loop" ? new { source = "static-list" } : new { amount };
 
         Console.WriteLine($"[run] workflow starting/replaying (variant={variant}, gateway={(gateway.IsIdempotent ? "idempotent" : "nonidempotent")})...");
@@ -161,6 +210,61 @@ public static class Program
                 return null;
             });
         }
+        else if (variant == "retry")
+        {
+            outcome = await host.RunAsync(definitionId, instanceId, workflowInput, async ctx =>
+            {
+                string txn = await ctx.CallActivityAsync<string>("ChargeCard", new { amount }, async actx =>
+                {
+                    counters.Bump("retryExecutions");
+                    File.AppendAllText(
+                        Path.Combine(CurrentStateDir(), "attempts.log"),
+                        $"{actx.Attempt}:{actx.IdempotencyKey}\n");
+                    // THE BETWEEN-ATTEMPTS KILL POINT: attempt 1's failure
+                    // is durable, attempt 2 has started, its own failure is
+                    // not yet recorded — the host dies inside the retry loop.
+                    if (_crashMode == "retry-kill-on-attempt-2" && actx.Attempt == 2)
+                        HardKill("retry: kill between attempts (attempt 1 failed durably, attempt 2 in flight)");
+                    if (actx.Attempt < 3)
+                        throw new InvalidOperationException($"transient gateway fault (attempt {actx.Attempt})");
+                    await Task.CompletedTask;
+                    return gateway.Charge(actx.IdempotencyKey, amount, $"{instanceId}-retry");
+                }, new RetryPolicy(3, TimeSpan.FromMilliseconds(50)));
+                Console.WriteLine($"[run] WORKFLOW COMPLETED (retry): retryExecutions={counters.Get("retryExecutions")}, " +
+                                  $"chargesApplied={counters.Get("chargesApplied")}");
+                return txn;
+            });
+        }
+        else if (variant == "timer")
+        {
+            outcome = await host.RunAsync(definitionId, instanceId, workflowInput, async ctx =>
+            {
+                // Wall-clock marks, appended per run: the scenario asserts
+                // the fire time against the FIRST run's start (the recorded
+                // due time), not against the resume's start.
+                AppendTimerMark("start");
+                await ctx.DelayAsync(TimeSpan.FromMilliseconds(3000));
+                AppendTimerMark("fired");
+                string txn = await Call(ctx, "ChargeCard", new { amount }, ChargeCard(counters, gateway, amount, instanceId));
+                Console.WriteLine($"[run] WORKFLOW COMPLETED (timer): chargeExecutions={counters.Get("chargeExecutions")}, " +
+                                  $"chargesApplied={counters.Get("chargesApplied")}");
+                return txn;
+            });
+        }
+        else if (variant == "signal")
+        {
+            outcome = await host.RunAsync(definitionId, instanceId, workflowInput, async ctx =>
+            {
+                Console.WriteLine("[signal] waiting for 'approve'");
+                Console.Out.Flush();
+                int approvedAmount = await ctx.WaitForSignalAsync<int>("approve");
+                string txn = await Call(ctx, "ChargeCard", new { amount = approvedAmount },
+                    ChargeCard(counters, gateway, approvedAmount, instanceId));
+                Console.WriteLine($"[run] WORKFLOW COMPLETED (signal): approvedAmount={approvedAmount}, " +
+                                  $"chargeExecutions={counters.Get("chargeExecutions")}, chargesApplied={counters.Get("chargesApplied")}");
+                return txn;
+            });
+        }
         else if (variant == "fanout")
         {
             int branch2Amount = int.TryParse(Environment.GetEnvironmentVariable("FAN_BRANCH2_AMOUNT"), out var b2)
@@ -169,10 +273,16 @@ public static class Program
             // Branch timing is scenario scaffolding only: it stages which
             // branches are in flight when a crash point fires. It is not
             // workflow structure — activities, inputs and order are the same
-            // in every mode; only the clock differs.
+            // in every mode; only the clock differs. The kill-mid margins
+            // are wide on purpose: the staging claims branch 1's completion
+            // is durable before branch 2's kill fires, and on a loaded
+            // machine (the suite runs providers in parallel) a short margin
+            // lets the kill catch branch 1 still in flight — the engine
+            // then correctly re-executes it, and the scenario's strict
+            // per-branch execution counts no longer describe the staging.
             int[] branchDelays = _crashMode switch
             {
-                "fanout-kill-mid" => new[] { 0, 250, 2000 },
+                "fanout-kill-mid" => new[] { 0, 1500, 5000 },
                 "fanout-kill-early" => new[] { 400, 250, 2000 },
                 _ => new[] { 0, 0, 0 },
             };
@@ -241,6 +351,8 @@ public static class Program
             }
         }
 
+        if (host.LastSnapshotUsed)
+            Console.WriteLine($"[history] snapshot used through {host.LastSnapshotThroughN}; tail replayed from there");
         if (host.LastLoad?.TornTailTruncated == true)
             Console.WriteLine("[history] torn tail write truncated; unterminated record discarded (never committed)");
         if (outcome == WorkflowRunOutcome.AlreadyCompleted)
@@ -270,6 +382,11 @@ public static class Program
         private static long _next;
         public static long Next() => ++_next;
     }
+
+    private static void AppendTimerMark(string mark) =>
+        File.AppendAllText(
+            Path.Combine(CurrentStateDir(), "timer.log"),
+            $"{mark} {DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}\n");
 
     private static Func<ActivityContext, Task<string>> ChargeCard(
         Counters counters, StubGateway gateway, int amount, string instanceId) =>

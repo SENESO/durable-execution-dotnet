@@ -40,7 +40,7 @@ namespace DurableExecution.SqlServer;
 /// history that moved — but nothing here fences writers *across* databases
 /// or machines. Cross-device fencing is P3; this provider does not fake it.
 /// </summary>
-public sealed class SqlHistoryStore : IHistoryStore, IDisposable
+public sealed class SqlHistoryStore : IHistoryStore, IHistorySnapshotStore, IDisposable
 {
     /// <summary>How long load waits for a previous owner's lock to clear before refusing (a killed owner's session is reaped asynchronously by the server).</summary>
     private static readonly TimeSpan LockGraceWindow = TimeSpan.FromSeconds(2);
@@ -48,6 +48,8 @@ public sealed class SqlHistoryStore : IHistoryStore, IDisposable
     private readonly string _connectionString;
     private readonly string _instanceId;
     private readonly IHistoryFaultInjector? _faultInjector;
+    private readonly int _snapshotInterval;
+    private HistorySnapshotBuilder _snapshotBuilder = HistorySnapshotCodec.Builder();
     private readonly object _gate = new();
 
     private SqlConnection? _connection;
@@ -60,13 +62,17 @@ public sealed class SqlHistoryStore : IHistoryStore, IDisposable
     /// <param name="connectionString">Connection string for the database that holds this history. The database must already exist; the store creates its table.</param>
     /// <param name="instanceId">The workflow instance whose history this store owns. Histories of other instances may share the database; they are never read or written here.</param>
     /// <param name="faultInjector">Crash-injection seam for the fault suite; production hosts attach none.</param>
-    public SqlHistoryStore(string connectionString, string instanceId, IHistoryFaultInjector? faultInjector = null)
+    public SqlHistoryStore(string connectionString, string instanceId, IHistoryFaultInjector? faultInjector = null,
+        int snapshotInterval = FileHistoryStore.DefaultSnapshotInterval)
     {
+        if (snapshotInterval < 0)
+            throw new ArgumentOutOfRangeException(nameof(snapshotInterval), "snapshot interval cannot be negative");
         _connectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
         _instanceId = string.IsNullOrEmpty(instanceId)
             ? throw new ArgumentException("instance id must be a non-empty string", nameof(instanceId))
             : instanceId;
         _faultInjector = faultInjector;
+        _snapshotInterval = snapshotInterval;
     }
 
     public HistoryLoadResult Load()
@@ -92,8 +98,77 @@ public sealed class SqlHistoryStore : IHistoryStore, IDisposable
 
             _nextSequence = events.Count + 1;
             _loaded = true;
+            _snapshotBuilder = HistorySnapshotCodec.Builder();
+            foreach (var historyEvent in events)
+                _snapshotBuilder.Apply(historyEvent);
             // A database history is transactional: no torn tail can exist.
             return new HistoryLoadResult(events, false, 0);
+        }
+    }
+
+    /// <summary>
+    /// Snapshot-aware load: validates the sealed snapshot, then reads and
+    /// validates only the rows after its point. A corrupt snapshot is
+    /// refused loudly — no silent fallback to a full replay.
+    /// </summary>
+    public HistorySnapshotLoadResult LoadFromSnapshot()
+    {
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            EnsureSession();
+
+            string? snapshotPayload;
+            using (var cmd = new SqlCommand(
+                "SELECT Payload FROM dbo.HistorySnapshots WHERE InstanceId = @instance", _connection))
+            {
+                cmd.Parameters.Add(InstanceParam());
+                snapshotPayload = cmd.ExecuteScalar() as string;
+            }
+            if (snapshotPayload is null)
+            {
+                var full = Load();
+                return new HistorySnapshotLoadResult(full, false, 0);
+            }
+
+            var snapshot = HistorySnapshotCodec.Parse(snapshotPayload, _instanceId);
+            long tableEnd;
+            using (var cmd = new SqlCommand(
+                "SELECT ISNULL(MAX(N), 0) FROM dbo.HistoryEvents WHERE InstanceId = @instance", _connection))
+            {
+                cmd.Parameters.Add(InstanceParam());
+                tableEnd = (long)cmd.ExecuteScalar();
+            }
+            if (tableEnd < snapshot.ThroughN)
+                throw new HistoryCorruptionException(
+                    $"snapshot: snapshot is ahead of history (snapshot through {snapshot.ThroughN}, history ends at {tableEnd})");
+
+            var builder = HistorySnapshotCodec.BuilderFrom(snapshot);
+            var events = builder.ToEvents();
+            var validator = new HistoryRecordValidator();
+            validator.SeedFromSnapshot(snapshot);
+            using (var cmd = new SqlCommand(
+                "SELECT Payload FROM dbo.HistoryEvents WHERE InstanceId = @instance AND N > @through ORDER BY N",
+                _connection))
+            {
+                cmd.Parameters.Add(InstanceParam());
+                cmd.Parameters.Add(new SqlParameter("@through", SqlDbType.BigInt) { Value = snapshot.ThroughN });
+                using var reader = cmd.ExecuteReader();
+                long ordinal = snapshot.ThroughN;
+                while (reader.Read())
+                {
+                    ordinal++;
+                    var tailEvent = validator.Validate(reader.GetString(0), ordinal);
+                    events.Add(tailEvent);
+                    builder.Apply(tailEvent);
+                }
+            }
+
+            _snapshotBuilder = builder;
+            _nextSequence = tableEnd + 1;
+            _loaded = true;
+            return new HistorySnapshotLoadResult(
+                new HistoryLoadResult(events, false, 0), true, snapshot.ThroughN);
         }
     }
 
@@ -145,6 +220,32 @@ public sealed class SqlHistoryStore : IHistoryStore, IDisposable
                 insert.ExecuteNonQuery();
             }
 
+            // A snapshot due at this append is written in the same
+            // transaction, so a committed history never points at a
+            // snapshot its own append did not commit.
+            HistorySnapshotBuilder? candidateBuilder = null;
+            if (_snapshotInterval > 0 && _nextSequence % _snapshotInterval == 0)
+            {
+                candidateBuilder = _snapshotBuilder.CanSnapshot
+                    ? HistorySnapshotCodec.BuilderFrom(_snapshotBuilder.Build())
+                    : HistorySnapshotCodec.Builder();
+                candidateBuilder.Apply(framed);
+                if (candidateBuilder.CanSnapshot)
+                {
+                    using var upsert = new SqlCommand(
+                        "MERGE dbo.HistorySnapshots AS target " +
+                        "USING (SELECT @instance AS InstanceId) AS source ON target.InstanceId = source.InstanceId " +
+                        "WHEN MATCHED THEN UPDATE SET ThroughN = @through, Payload = @payload " +
+                        "WHEN NOT MATCHED THEN INSERT (InstanceId, ThroughN, Payload) VALUES (@instance, @through, @payload);",
+                        _connection, tx);
+                    upsert.Parameters.Add(InstanceParam());
+                    upsert.Parameters.Add(new SqlParameter("@through", SqlDbType.BigInt) { Value = _nextSequence });
+                    upsert.Parameters.Add(new SqlParameter("@payload", SqlDbType.NVarChar, -1)
+                    { Value = HistorySnapshotCodec.Serialize(candidateBuilder.Build()) });
+                    upsert.ExecuteNonQuery();
+                }
+            }
+
             if (tear)
             {
                 // The harness kills the process inside OnTornWrite; the open
@@ -160,6 +261,10 @@ public sealed class SqlHistoryStore : IHistoryStore, IDisposable
 
             tx.Commit();
             _nextSequence++;
+            if (candidateBuilder is not null)
+                _snapshotBuilder = candidateBuilder;
+            else
+                _snapshotBuilder.Apply(framed);
             return framed;
         }
     }
@@ -261,6 +366,17 @@ public sealed class SqlHistoryStore : IHistoryStore, IDisposable
                 _connection, tx))
             {
                 create.ExecuteNonQuery();
+            }
+            using (var createSnapshots = new SqlCommand(
+                "IF OBJECT_ID(N'dbo.HistorySnapshots', N'U') IS NULL " +
+                "CREATE TABLE dbo.HistorySnapshots (" +
+                "  InstanceId NVARCHAR(128) NOT NULL," +
+                "  ThroughN BIGINT NOT NULL," +
+                "  Payload NVARCHAR(MAX) NOT NULL," +
+                "  CONSTRAINT PK_HistorySnapshots PRIMARY KEY (InstanceId));",
+                _connection, tx))
+            {
+                createSnapshots.ExecuteNonQuery();
             }
             tx.Commit();
             _schemaReady = true;

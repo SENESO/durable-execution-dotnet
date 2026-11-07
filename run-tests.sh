@@ -4,13 +4,16 @@
 # scenarios across real process kills, plus the store/identity/host unit
 # tests. A phase advances only when this runs green.
 #
-# Provider coverage (§6.5): the suite runs per provider. The file provider
-# always runs. The SQL Server provider runs when DE_SQLSERVER_CONNECTION
-# names a test SQL Server (a master connection under a login that may
-# create and drop scratch databases; the suite provisions and drops one
-# database per test). Without it, the SQL Server classes are excluded by
-# trait — so the file evidence stays reproducible on any machine, and the
-# SQL evidence is claimed only where it actually ran.
+# Provider coverage (§6.5): the suite runs per provider. The file and
+# SQLite providers always run (SQLite is embedded; it needs no server).
+# The SQL Server provider runs when DE_SQLSERVER_CONNECTION names a test
+# SQL Server, and the PostgreSQL provider runs when DE_POSTGRES_CONNECTION
+# names a test PostgreSQL server (in both cases a master connection under
+# a login that may create and drop scratch databases; the suite provisions
+# and drops one database per test). Without a variable, that provider's
+# classes are excluded by trait — so the local evidence stays reproducible
+# on any machine, and a server provider's evidence is claimed only where
+# it actually ran.
 set -Eeuo pipefail
 cd "$(dirname "$0")"
 
@@ -24,21 +27,34 @@ echo "== building (Release) =="
 TEST_DLL="tests/DurableExecution.Tests/bin/Release/net8.0/DurableExecution.Tests.dll"
 RUNNER="$HOME/workspace/.xunit-runner/pkg/tools/net6.0/xunit.console.dll"
 
-if [ -n "${DE_SQLSERVER_CONNECTION:-}" ]; then
-  echo "== running the suite (file + SQL Server providers) =="
-  TRAIT_ARGS=()
+TRAIT_ARGS=()
+FILTER_PARTS=()
+PROVIDERS_RAN="file + SQLite"
+
+if [ -z "${DE_SQLSERVER_CONNECTION:-}" ]; then
+  TRAIT_ARGS+=(-notrait "Provider=SqlServer")
+  FILTER_PARTS+=("Provider!=SqlServer")
 else
-  echo "== running the suite (file provider; SQL Server classes excluded — DE_SQLSERVER_CONNECTION not set) =="
-  TRAIT_ARGS=(-notrait "Provider=SqlServer")
+  PROVIDERS_RAN+=", SQL Server"
 fi
+
+if [ -z "${DE_POSTGRES_CONNECTION:-}" ]; then
+  TRAIT_ARGS+=(-notrait "Provider=PostgreSql")
+  FILTER_PARTS+=("Provider!=PostgreSql")
+else
+  PROVIDERS_RAN+=", PostgreSQL"
+fi
+
+echo "== running the suite (providers: $PROVIDERS_RAN) =="
 
 if [ -f "$RUNNER" ]; then
   # Console-runner path (used where the vstest host cannot run).
   "$DOTNET" exec --roll-forward LatestMajor "$RUNNER" "$TEST_DLL" "${TRAIT_ARGS[@]}"
 else
-  if [ -n "${DE_SQLSERVER_CONNECTION:-}" ]; then
+  if [ "${#FILTER_PARTS[@]}" -eq 0 ]; then
     "$DOTNET" test DurableExecution.sln -c Release --no-build
   else
-    "$DOTNET" test DurableExecution.sln -c Release --no-build --filter "Provider!=SqlServer"
+    FILTER="$(IFS='&'; echo "${FILTER_PARTS[*]}")"
+    "$DOTNET" test DurableExecution.sln -c Release --no-build --filter "$FILTER"
   fi
 fi

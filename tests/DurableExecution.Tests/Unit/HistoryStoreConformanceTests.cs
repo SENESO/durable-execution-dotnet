@@ -1,7 +1,11 @@
 using System.Text.Json.Nodes;
 using DurableExecution.History;
+using DurableExecution.PostgreSql;
+using DurableExecution.Sqlite;
 using DurableExecution.SqlServer;
 using Microsoft.Data.SqlClient;
+using Microsoft.Data.Sqlite;
+using Npgsql;
 
 namespace DurableExecution.Tests.Unit;
 
@@ -25,7 +29,7 @@ public interface IHistoryStoreFixture : IDisposable
 }
 
 /// <summary>The file provider's fixture: the history is a fresh directory's log.</summary>
-public sealed class FileHistoryStoreFixture : IHistoryStoreFixture
+public sealed class FileHistoryStoreFixture : ISnapshotStoreFixture
 {
     private readonly string _dir;
     private IHistoryStore? _current;
@@ -39,7 +43,7 @@ public sealed class FileHistoryStoreFixture : IHistoryStoreFixture
     public IHistoryStore CreateStore()
     {
         (_current as IDisposable)?.Dispose();
-        _current = new FileHistoryStore(_dir);
+        _current = new FileHistoryStore(_dir, snapshotInterval: 3);
         return _current;
     }
 
@@ -55,6 +59,14 @@ public sealed class FileHistoryStoreFixture : IHistoryStoreFixture
             Path.Combine(_dir, "history.log"),
             records.Length == 0 ? "" : string.Join("\n", records) + "\n");
 
+    public string SnapshotPath => Path.Combine(_dir, "history.snapshot.json");
+
+    public void CorruptSnapshot()
+    {
+        string path = SnapshotPath;
+        File.WriteAllText(path, File.ReadAllText(path).Replace("order/v1", "order/v9"));
+    }
+
     public void Dispose() => (_current as IDisposable)?.Dispose();
 }
 
@@ -63,7 +75,7 @@ public sealed class FileHistoryStoreFixture : IHistoryStoreFixture
 /// a throwaway database. Raw records are written with a plain connection —
 /// the test acts as the disk, not as a store.
 /// </summary>
-public sealed class SqlHistoryStoreFixture : IHistoryStoreFixture
+public sealed class SqlHistoryStoreFixture : ISnapshotStoreFixture
 {
     private const string Instance = "inst-1";
 
@@ -73,7 +85,7 @@ public sealed class SqlHistoryStoreFixture : IHistoryStoreFixture
     public IHistoryStore CreateStore()
     {
         (_current as IDisposable)?.Dispose();
-        _current = new SqlHistoryStore(_database.Connection, Instance);
+        _current = new SqlHistoryStore(_database.Connection, Instance, snapshotInterval: 3);
         return _current;
     }
 
@@ -107,6 +119,12 @@ public sealed class SqlHistoryStoreFixture : IHistoryStoreFixture
             insert.Parameters.Add(new SqlParameter("@payload", System.Data.SqlDbType.NVarChar, -1) { Value = records[i] });
             insert.ExecuteNonQuery();
         }
+    }
+
+    public void CorruptSnapshot()
+    {
+        SqlTestDatabases.Execute(_database.Connection,
+            "UPDATE dbo.HistorySnapshots SET Payload = REPLACE(Payload, 'order/v1', 'order/v9') WHERE InstanceId = 'inst-1'");
     }
 
     public void Dispose()
@@ -289,3 +307,136 @@ public sealed class HistoryStoreConformanceTestsFile() : HistoryStoreConformance
 /// <summary>The conformance contract against the SQL Server provider (§6.5).</summary>
 [Trait("Provider", "SqlServer")]
 public sealed class HistoryStoreConformanceTestsSqlServer() : HistoryStoreConformanceTests(new SqlHistoryStoreFixture());
+
+
+/// <summary>
+/// The PostgreSQL provider's fixture: the history is one instance's rows in
+/// a throwaway database. Raw records are written with a plain connection.
+/// </summary>
+public sealed class PostgresHistoryStoreFixture : ISnapshotStoreFixture
+{
+    private const string Instance = "inst-1";
+
+    private readonly (string Name, string Connection) _database = PostgresTestDatabases.CreateDatabase("store");
+    private IHistoryStore? _current;
+
+    public IHistoryStore CreateStore()
+    {
+        (_current as IDisposable)?.Dispose();
+        _current = new PostgresHistoryStore(_database.Connection, Instance, snapshotInterval: 3);
+        return _current;
+    }
+
+    public IHistoryStore CreateLoadedStore()
+    {
+        var store = CreateStore();
+        store.Load();
+        return store;
+    }
+
+    public void WriteRawRecords(params string[] records)
+    {
+        PostgresTestDatabases.EnsureTable(_database.Connection);
+        PostgresTestDatabases.Execute(_database.Connection,
+            "DELETE FROM public.history_events WHERE instance_id = 'inst-1'");
+        for (int i = 0; i < records.Length; i++)
+            PostgresTestDatabases.InsertPayload(_database.Connection, Instance, i + 1, records[i]);
+    }
+
+    public void CorruptSnapshot()
+    {
+        PostgresTestDatabases.Execute(_database.Connection,
+            "UPDATE public.history_snapshots SET payload = REPLACE(payload, 'order/v1', 'order/v9') WHERE instance_id = 'inst-1'");
+    }
+
+    public void Dispose()
+    {
+        (_current as IDisposable)?.Dispose();
+        try { PostgresTestDatabases.DropDatabase(_database.Name); }
+        catch (NpgsqlException) { /* best-effort cleanup of a scratch database */ }
+    }
+}
+
+/// <summary>
+/// The SQLite provider's fixture: the history is a fresh directory's
+/// database file. Raw records replace the table's rows directly.
+/// </summary>
+public sealed class SqliteHistoryStoreFixture : ISnapshotStoreFixture
+{
+    private readonly string _dir;
+    private IHistoryStore? _current;
+
+    public SqliteHistoryStoreFixture()
+    {
+        _dir = Path.Combine(Path.GetTempPath(), "p0-unit", Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(_dir);
+    }
+
+    public IHistoryStore CreateStore()
+    {
+        (_current as IDisposable)?.Dispose();
+        _current = new SqliteHistoryStore(_dir, snapshotInterval: 3);
+        return _current;
+    }
+
+    public IHistoryStore CreateLoadedStore()
+    {
+        var store = CreateStore();
+        store.Load();
+        return store;
+    }
+
+    public void WriteRawRecords(params string[] records)
+    {
+        (_current as IDisposable)?.Dispose();
+        _current = null;
+        var builder = new SqliteConnectionStringBuilder
+        {
+            DataSource = Path.Combine(_dir, "history.db"),
+            Mode = SqliteOpenMode.ReadWriteCreate,
+            Pooling = false,
+        };
+        using var conn = new SqliteConnection(builder.ConnectionString);
+        conn.Open();
+        using (var create = new SqliteCommand(
+            "CREATE TABLE IF NOT EXISTS HistoryEvents (N INTEGER NOT NULL PRIMARY KEY, Payload TEXT NOT NULL);", conn))
+            create.ExecuteNonQuery();
+        using (var delete = new SqliteCommand("DELETE FROM HistoryEvents", conn))
+            delete.ExecuteNonQuery();
+        for (int i = 0; i < records.Length; i++)
+        {
+            using var insert = new SqliteCommand(
+                "INSERT INTO HistoryEvents (N, Payload) VALUES (@n, @payload)", conn);
+            insert.Parameters.Add(new SqliteParameter("@n", SqliteType.Integer) { Value = (long)(i + 1) });
+            insert.Parameters.Add(new SqliteParameter("@payload", SqliteType.Text) { Value = records[i] });
+            insert.ExecuteNonQuery();
+        }
+    }
+
+    public void CorruptSnapshot()
+    {
+        (_current as IDisposable)?.Dispose();
+        _current = null;
+        var builder = new SqliteConnectionStringBuilder
+        {
+            DataSource = Path.Combine(_dir, "history.db"),
+            Mode = SqliteOpenMode.ReadWrite,
+            Pooling = false,
+        };
+        using var conn = new SqliteConnection(builder.ConnectionString);
+        conn.Open();
+        using var cmd = new SqliteCommand(
+            "UPDATE HistorySnapshots SET Payload = REPLACE(Payload, 'order/v1', 'order/v9') WHERE Id = 1", conn);
+        cmd.ExecuteNonQuery();
+    }
+
+    public void Dispose() => (_current as IDisposable)?.Dispose();
+}
+
+/// <summary>The conformance contract against the PostgreSQL provider (§6.5).</summary>
+[Trait("Provider", "PostgreSql")]
+public sealed class HistoryStoreConformanceTestsPostgreSql() : HistoryStoreConformanceTests(new PostgresHistoryStoreFixture());
+
+/// <summary>The conformance contract against the SQLite provider (§6.5).</summary>
+[Trait("Provider", "Sqlite")]
+public sealed class HistoryStoreConformanceTestsSqlite() : HistoryStoreConformanceTests(new SqliteHistoryStoreFixture());

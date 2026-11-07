@@ -27,16 +27,20 @@ public sealed class WorkflowHost : IDisposable
 {
     private readonly IHistoryStore _store;
     private readonly string _namespaceId;
+    private readonly IWorkflowClock _clock;
     private readonly FileStream _ownershipLock;
+    private WorkflowContext? _activeContext;
 
     /// <param name="store">The history store for the instance (already bound to its state directory).</param>
     /// <param name="stateDirectory">Directory holding the single-writer lock file.</param>
     /// <param name="namespaceId">Tenant namespace (ADR-010: shaped from v1; P0 runs one namespace).</param>
     /// <exception cref="StateOwnedByAnotherHostException">Another running host owns this state.</exception>
-    public WorkflowHost(IHistoryStore store, string stateDirectory, string namespaceId = "default")
+    public WorkflowHost(IHistoryStore store, string stateDirectory, string namespaceId = "default",
+        IWorkflowClock? clock = null)
     {
         _store = store;
         _namespaceId = namespaceId;
+        _clock = clock ?? SystemWorkflowClock.Instance;
         Directory.CreateDirectory(stateDirectory);
         string lockPath = Path.Combine(stateDirectory, "host.lock");
         try
@@ -52,6 +56,12 @@ public sealed class WorkflowHost : IDisposable
 
     /// <summary>The most recent load's outcome, including torn-tail repair.</summary>
     public HistoryLoadResult? LastLoad { get; private set; }
+
+    /// <summary>True when the most recent load resumed from a sealed snapshot plus its tail.</summary>
+    public bool LastSnapshotUsed { get; private set; }
+
+    /// <summary>The event sequence the most recent snapshot load resumed from (0 when no snapshot was used).</summary>
+    public long LastSnapshotThroughN { get; private set; }
 
     /// <summary>
     /// Starts or resumes the instance. On resume, the recorded definition id
@@ -69,7 +79,20 @@ public sealed class WorkflowHost : IDisposable
         object? input,
         Func<WorkflowContext, Task<object?>> body)
     {
-        var load = _store.Load();
+        HistoryLoadResult load;
+        if (_store is IHistorySnapshotStore snapshotStore)
+        {
+            var snapshotLoad = snapshotStore.LoadFromSnapshot();
+            load = snapshotLoad.Load;
+            LastSnapshotUsed = snapshotLoad.SnapshotUsed;
+            LastSnapshotThroughN = snapshotLoad.SnapshotThroughN;
+        }
+        else
+        {
+            load = _store.Load();
+            LastSnapshotUsed = false;
+            LastSnapshotThroughN = 0;
+        }
         LastLoad = load;
         var history = new List<HistoryEvent>(load.Events);
         string inputFingerprint = Fingerprints.InputFingerprint(input);
@@ -93,10 +116,36 @@ public sealed class WorkflowHost : IDisposable
                 HistoryEvent.WorkflowStarted(instanceId, definitionId, inputFingerprint)));
         }
 
-        var context = new WorkflowContext(_namespaceId, instanceId, _store, history);
-        object? result = await body(context);
-        _store.Append(HistoryEvent.WorkflowCompleted(instanceId, result));
-        return WorkflowRunOutcome.Completed;
+        var context = new WorkflowContext(_namespaceId, instanceId, _store, history, _clock);
+        _activeContext = context;
+        try
+        {
+            object? result = await body(context);
+            _store.Append(HistoryEvent.WorkflowCompleted(instanceId, result));
+            return WorkflowRunOutcome.Completed;
+        }
+        finally
+        {
+            _activeContext = null;
+        }
+    }
+
+    /// <summary>
+    /// Delivers an external signal to the workflow running on this host:
+    /// the signal is appended to history first and delivered to a waiting
+    /// workflow only after the record is durable. For a workflow that is
+    /// not running, append <c>SignalReceived</c> to its history store
+    /// before the run starts (the store's single-writer lock is free
+    /// then); the workflow receives it from history when it waits.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">No run is active on this host.</exception>
+    public void SendSignal(string name, object? payload)
+    {
+        var context = _activeContext
+            ?? throw new InvalidOperationException(
+                "no workflow run is active on this host — a signal for a non-running workflow is " +
+                "appended to its history store before the run starts, and delivered from history");
+        context.DeliverSignal(name, payload);
     }
 
     /// <summary>

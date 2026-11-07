@@ -11,7 +11,11 @@ namespace DurableExecution.Execution;
 /// <param name="Activity">The activity's stable identity (its name).</param>
 /// <param name="Input">The branch input; its fingerprint is recorded and re-checked on replay.</param>
 /// <param name="Body">The activity body; receives the branch's own <see cref="ActivityContext"/>.</param>
-public sealed record ActivityCall<T>(string Activity, object? Input, Func<ActivityContext, Task<T>> Body);
+public sealed record ActivityCall<T>(string Activity, object? Input, Func<ActivityContext, Task<T>> Body)
+{
+    /// <summary>Optional retry policy for this branch; null means a faulted branch records no failure and re-executes only on resume.</summary>
+    public RetryPolicy? RetryPolicy { get; init; }
+}
 
 /// <summary>
 /// A fan-out branch whose body returns no result — the non-generic sibling of
@@ -20,4 +24,8 @@ public sealed record ActivityCall<T>(string Activity, object? Input, Func<Activi
 /// <param name="Activity">The activity's stable identity (its name).</param>
 /// <param name="Input">The branch input; its fingerprint is recorded and re-checked on replay.</param>
 /// <param name="Body">The activity body; receives the branch's own <see cref="ActivityContext"/>.</param>
-public sealed record ActivityCall(string Activity, object? Input, Func<ActivityContext, Task> Body);
+public sealed record ActivityCall(string Activity, object? Input, Func<ActivityContext, Task> Body)
+{
+    /// <summary>Optional retry policy for this branch; null means a faulted branch records no failure and re-executes only on resume.</summary>
+    public RetryPolicy? RetryPolicy { get; init; }
+}

@@ -332,3 +332,11 @@ public sealed class FanOutTestsFile() : FanOutTests(new FileStoreFactory());
 /// <summary>Fan-out unit tests against the SQL Server provider (§6.5 conformance).</summary>
 [Trait("Provider", "SqlServer")]
 public sealed class FanOutTestsSqlServer() : FanOutTests(new SqlStoreFactory());
+
+/// <summary>Fan-out tests against the PostgreSQL provider (§6.5 conformance).</summary>
+[Trait("Provider", "PostgreSql")]
+public sealed class FanOutTestsPostgreSql() : FanOutTests(new PostgresStoreFactory());
+
+/// <summary>Fan-out tests against the SQLite provider (§6.5 conformance).</summary>
+[Trait("Provider", "Sqlite")]
+public sealed class FanOutTestsSqlite() : FanOutTests(new SqliteStoreFactory());

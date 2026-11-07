@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json.Nodes;
+using DurableExecution.IO;
 
 namespace DurableExecution.History;
 
@@ -24,21 +25,35 @@ namespace DurableExecution.History;
 /// must match its scheduled command's activity; <c>WorkflowCompleted</c> is
 /// unique and last.
 /// </summary>
-public sealed class FileHistoryStore : IHistoryStore
+public sealed class FileHistoryStore : IHistoryStore, IHistorySnapshotStore
 {
+    /// <summary>Default snapshot cadence: one sealed snapshot per 50 appended events (0 disables snapshots).</summary>
+    public const int DefaultSnapshotInterval = 50;
+
     private readonly string _historyPath;
+    private readonly string _snapshotPath;
     private readonly IHistoryFaultInjector? _faultInjector;
+    private readonly int _snapshotInterval;
+    private HistorySnapshotBuilder _snapshotBuilder = HistorySnapshotCodec.Builder();
     private long _nextSequence = 1;
     private bool _loaded;
 
-    public FileHistoryStore(string stateDirectory, IHistoryFaultInjector? faultInjector = null)
+    public FileHistoryStore(string stateDirectory, IHistoryFaultInjector? faultInjector = null,
+        int snapshotInterval = DefaultSnapshotInterval)
     {
+        if (snapshotInterval < 0)
+            throw new ArgumentOutOfRangeException(nameof(snapshotInterval), "snapshot interval cannot be negative");
         Directory.CreateDirectory(stateDirectory);
         _historyPath = Path.Combine(stateDirectory, "history.log");
+        _snapshotPath = Path.Combine(stateDirectory, "history.snapshot.json");
         _faultInjector = faultInjector;
+        _snapshotInterval = snapshotInterval;
     }
 
     public string HistoryPath => _historyPath;
+
+    /// <summary>Path of the latest sealed snapshot, when one has been written.</summary>
+    public string SnapshotPath => _snapshotPath;
 
     internal static string Canonical(JsonObject fields) => HistorySealing.Canonical(fields);
 
@@ -49,6 +64,7 @@ public sealed class FileHistoryStore : IHistoryStore
         var events = new List<HistoryEvent>();
         _loaded = true;
         _nextSequence = 1;
+        _snapshotBuilder = HistorySnapshotCodec.Builder();
         if (!File.Exists(_historyPath))
             return new HistoryLoadResult(events, false, 0);
 
@@ -83,7 +99,65 @@ public sealed class FileHistoryStore : IHistoryStore
         }
 
         _nextSequence = events.Count + 1;
+        _snapshotBuilder = HistorySnapshotCodec.Builder();
+        foreach (var historyEvent in events)
+            _snapshotBuilder.Apply(historyEvent);
         return new HistoryLoadResult(events, torn, tornBytes);
+    }
+
+    /// <summary>
+    /// Snapshot-aware load: validates the sealed snapshot, then parses and
+    /// validates only the records after its point (the prefix is represented
+    /// by the snapshot's reconstructed state). A corrupt snapshot is refused
+    /// loudly — there is no silent fallback to a full replay.
+    /// </summary>
+    public HistorySnapshotLoadResult LoadFromSnapshot()
+    {
+        if (!File.Exists(_snapshotPath))
+        {
+            var full = Load();
+            return new HistorySnapshotLoadResult(full, false, 0);
+        }
+
+        var snapshot = HistorySnapshotCodec.Parse(File.ReadAllText(_snapshotPath));
+        _loaded = true;
+
+        byte[] bytes = File.Exists(_historyPath) ? File.ReadAllBytes(_historyPath) : Array.Empty<byte>();
+        var records = new List<(int Start, int Length)>();
+        int start = 0;
+        for (int i = 0; i < bytes.Length; i++)
+        {
+            if (bytes[i] == 0x0A) { records.Add((start, i - start)); start = i + 1; }
+        }
+        bool torn = false;
+        long tornBytes = 0;
+        if (start < bytes.Length)
+        {
+            torn = true;
+            tornBytes = bytes.Length - start;
+            using var fs = new FileStream(_historyPath, FileMode.Open, FileAccess.Write);
+            fs.SetLength(start);
+        }
+        if (records.Count < snapshot.ThroughN)
+            throw new HistoryCorruptionException(
+                $"snapshot: snapshot is ahead of history (snapshot through {snapshot.ThroughN}, history has {records.Count} records)");
+
+        var builder = HistorySnapshotCodec.BuilderFrom(snapshot);
+        var events = builder.ToEvents();
+        var validator = new HistoryRecordValidator();
+        validator.SeedFromSnapshot(snapshot);
+        for (int r = (int)snapshot.ThroughN; r < records.Count; r++)
+        {
+            string line = Encoding.UTF8.GetString(bytes, records[r].Start, records[r].Length);
+            var tailEvent = validator.Validate(line, r + 1);
+            events.Add(tailEvent);
+            builder.Apply(tailEvent);
+        }
+
+        _snapshotBuilder = builder;
+        _nextSequence = records.Count + 1;
+        return new HistorySnapshotLoadResult(
+            new HistoryLoadResult(events, torn, tornBytes), true, snapshot.ThroughN);
     }
 
     public HistoryEvent Append(HistoryEvent historyEvent)
@@ -113,6 +187,13 @@ public sealed class FileHistoryStore : IHistoryStore
             fs.Flush(true);
         }
         _nextSequence++;
-        return new HistoryEvent(fields);
+        var framedEvent = new HistoryEvent(fields);
+        _snapshotBuilder.Apply(framedEvent);
+        if (_snapshotInterval > 0 && framedEvent.N % _snapshotInterval == 0 && _snapshotBuilder.CanSnapshot)
+        {
+            AtomicFile.WriteAllText(_snapshotPath,
+                HistorySnapshotCodec.Serialize(_snapshotBuilder.Build()));
+        }
+        return framedEvent;
     }
 }

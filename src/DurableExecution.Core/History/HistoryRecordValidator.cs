@@ -24,8 +24,56 @@ internal sealed class HistoryRecordValidator
     private readonly Dictionary<long, string> _scheduled = new();
     private readonly HashSet<long> _completed = new();
     private readonly Dictionary<long, long> _attempts = new();
+    private readonly HashSet<(long Seq, long Attempt)> _failedAttempts = new();
+    private readonly Dictionary<long, string> _timers = new();
+    private readonly HashSet<long> _timersFired = new();
     private bool _startedSeen;
     private bool _workflowCompletedSeen;
+
+    /// <summary>
+    /// Seeds the validator with the state a sealed snapshot stands for, so a
+    /// snapshot-aware load can validate only the tail after the snapshot
+    /// point under exactly the rules the full prefix was validated under.
+    /// The snapshot was itself sealed and parsed by
+    /// <see cref="HistorySnapshotCodec"/> before this is called.
+    /// </summary>
+    internal void SeedFromSnapshot(HistorySnapshot snapshot)
+    {
+        _startedSeen = true;
+        foreach (var kv in snapshot.AttemptCounts)
+            _attempts[long.Parse(kv.Key)] = kv.Value!.GetValue<long>();
+        foreach (var node in snapshot.Facts)
+        {
+            var fact = node!.AsObject();
+            string type = fact["type"]!.GetValue<string>();
+            switch (type)
+            {
+                case HistoryEventTypes.ActivityScheduled:
+                    _scheduled[fact["seq"]!.GetValue<long>()] = fact["activity"]!.GetValue<string>();
+                    break;
+                case HistoryEventTypes.ActivityCompleted:
+                    _completed.Add(fact["seq"]!.GetValue<long>());
+                    break;
+                case HistoryEventTypes.ActivityAttemptFailed:
+                    long failedSeq = fact["seq"]!.GetValue<long>();
+                    long failedAttempt = fact["attempt"]!.GetValue<long>();
+                    if (failedAttempt < 1 || failedAttempt > _attempts.GetValueOrDefault(failedSeq))
+                        throw new HistoryCorruptionException(
+                            $"snapshot: attempt failure recorded for attempt {failedAttempt} of command {failedSeq}, which the snapshot's attempt counts do not cover");
+                    _failedAttempts.Add((failedSeq, failedAttempt));
+                    break;
+                case HistoryEventTypes.TimerScheduled:
+                    _timers[fact["seq"]!.GetValue<long>()] = fact["dueAt"]!.GetValue<string>();
+                    break;
+                case HistoryEventTypes.TimerFired:
+                    _timersFired.Add(fact["seq"]!.GetValue<long>());
+                    break;
+                case HistoryEventTypes.WorkflowCompleted:
+                    _workflowCompletedSeen = true;
+                    break;
+            }
+        }
+    }
 
     /// <summary>
     /// Parses and validates the record expected at the 1-based
@@ -82,6 +130,8 @@ internal sealed class HistoryRecordValidator
                     throw Corrupt($"{ctx}: inputHash malformed");
                 if (seq < 1)
                     throw Corrupt($"{ctx}: seq must be >= 1");
+                if (_timers.ContainsKey(seq))
+                    throw Corrupt($"{ctx}: command position {seq} is already a timer");
                 if (!_scheduled.TryAdd(seq, activity))
                     throw Corrupt($"{ctx}: duplicate ActivityScheduled for command {seq}");
                 break;
@@ -100,6 +150,22 @@ internal sealed class HistoryRecordValidator
                 break;
             }
 
+            case HistoryEventTypes.ActivityAttemptFailed:
+            {
+                long seq = ReqLong(el, "seq", ctx);
+                long attempt = ReqLong(el, "attempt", ctx);
+                ReqString(el, "error", ctx);
+                if (!_scheduled.ContainsKey(seq))
+                    throw Corrupt($"{ctx}: attempt failure for unscheduled command {seq}");
+                if (_completed.Contains(seq))
+                    throw Corrupt($"{ctx}: attempt failure for already-completed command {seq}");
+                if (attempt != _attempts.GetValueOrDefault(seq))
+                    throw Corrupt($"{ctx}: attempt failure names attempt {attempt} of command {seq}, but the latest started attempt is {_attempts.GetValueOrDefault(seq)}");
+                if (!_failedAttempts.Add((seq, attempt)))
+                    throw Corrupt($"{ctx}: duplicate attempt failure for attempt {attempt} of command {seq}");
+                break;
+            }
+
             case HistoryEventTypes.ActivityCompleted:
             {
                 long seq = ReqLong(el, "seq", ctx);
@@ -112,6 +178,37 @@ internal sealed class HistoryRecordValidator
                     throw Corrupt($"{ctx}: duplicate ActivityCompleted for command {seq}");
                 break;
             }
+
+            case HistoryEventTypes.TimerScheduled:
+            {
+                long seq = ReqLong(el, "seq", ctx);
+                string dueAt = ReqString(el, "dueAt", ctx);
+                if (!DateTimeOffset.TryParse(dueAt, out _))
+                    throw Corrupt($"{ctx}: TimerScheduled.dueAt malformed");
+                if (ReqLong(el, "durationMs", ctx) < 0)
+                    throw Corrupt($"{ctx}: TimerScheduled.durationMs must be >= 0");
+                if (seq < 1)
+                    throw Corrupt($"{ctx}: seq must be >= 1");
+                if (_scheduled.ContainsKey(seq))
+                    throw Corrupt($"{ctx}: command position {seq} is already an activity");
+                if (!_timers.TryAdd(seq, dueAt))
+                    throw Corrupt($"{ctx}: duplicate TimerScheduled for command {seq}");
+                break;
+            }
+
+            case HistoryEventTypes.TimerFired:
+            {
+                long seq = ReqLong(el, "seq", ctx);
+                if (!_timers.ContainsKey(seq))
+                    throw Corrupt($"{ctx}: TimerFired without TimerScheduled for command {seq}");
+                if (!_timersFired.Add(seq))
+                    throw Corrupt($"{ctx}: duplicate TimerFired for command {seq}");
+                break;
+            }
+
+            case HistoryEventTypes.SignalReceived:
+                ReqString(el, "name", ctx);
+                break;
 
             case HistoryEventTypes.WorkflowCompleted:
                 _workflowCompletedSeen = true;
