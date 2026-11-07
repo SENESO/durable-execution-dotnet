@@ -194,6 +194,29 @@ public class HostInProcessTests
     }
 
     [Fact]
+    public async Task ResumeWithChangedCommandActivity_ThrowsNonDeterminismViolation()
+    {
+        string dir = FreshDir();
+        string activity = "ChargeCard";
+        Func<WorkflowContext, Task<object?>> body = async ctx =>
+        {
+            await ctx.CallActivityAsync<string>(activity, new { amount = 1000 }, actx =>
+                throw new SimulatedCrashException()); // scheduled + attempted, never completed
+            return null;
+        };
+
+        using (var host = OpenHost(dir))
+            await Assert.ThrowsAsync<SimulatedCrashException>(() =>
+                host.RunAsync("order/v1", "order-1001", new { amount = 1000 }, body));
+
+        activity = "ChargeCardV2"; // the code now asks the recorded position for a different activity
+        using var resumed = OpenHost(dir);
+        var ex = await Assert.ThrowsAsync<NonDeterminismViolationException>(() =>
+            resumed.RunAsync("order/v1", "order-1001", new { amount = 1000 }, body));
+        Assert.Contains("was recorded as 'ChargeCard'", ex.Message);
+    }
+
+    [Fact]
     public void SecondHostOnSameState_IsRefusedWhileFirstHostLives()
     {
         string dir = FreshDir();

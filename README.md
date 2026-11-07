@@ -72,14 +72,23 @@ substance because every other claim in this repository is bounded by it.
   retries are attempts (`ActivityAttemptStarted`) under the same identity and
   the same key. The key reaches the activity through `ActivityContext`; on
   replay the *recorded* key is passed verbatim.
+- **Fan-out** (`CallAllAsync`, the §5.3 `WhenAll`): branches are scheduled
+  synchronously in list order — each branch's position, input fingerprint
+  and idempotency key settled before any branch runs — then executed
+  concurrently, each completion recorded as it lands; results combine in
+  schedule order regardless of completion order. A faulted branch keeps the
+  other branches' recorded completions and re-executes alone on resume
+  under its recorded key; a changed branch definition is refused by the
+  same fingerprint checks as a sequential call.
 - **Crash-safe auxiliary writes**: atomic file replacement (temporary file +
   fsync + rename) for counters and ledgers, and a single-writer OS lock per
   instance state — a second host is refused.
 - **The crash-injection suite** (§7): a scriptable payment-gateway stub in
   idempotent and non-idempotent modes, a resumable reconciliation command,
-  and 11 scenarios (A–K) executed across real process kills, with strict
-  assertions over counters, history, the gateway call log, and the gateway
-  ledger. Counters are cross-checked against recorded attempts — evidence is
+  and 11 scenarios (A–K) executed across real process kills, plus three
+  fan-out scenarios (L–N) over parallel branches, with strict assertions
+  over counters, history, the gateway call log, and the gateway ledger.
+  Counters are cross-checked against recorded attempts — evidence is
   verified, not eyeballed.
 
 The P0 reference workflow is deliberately minimal (Foundation §14):
@@ -101,7 +110,7 @@ src/DurableExecution.Core/        the library (stage A core)
   Execution/                      host, workflow context, identity, fingerprints
   IO/                             atomic durable file writes
 tests/DurableExecution.TestHost/  scenario host process the suite kills/restarts
-tests/DurableExecution.Tests/     xUnit: Scenarios (A–K) + Unit (store, keys, host)
+tests/DurableExecution.Tests/     xUnit: Scenarios (A–K, fan-out L–N) + Unit (store, keys, host, fan-out)
 ```
 
 `IHistoryStore` is the seam the distributed runtime (stage B) and the future
@@ -115,7 +124,7 @@ contract (Foundation §6.5) before it may ship.
 ```
 
 Builds the solution in Release and runs the whole suite from a clean
-checkout. Latest recorded result (2026-11-07): **34 passed, 0 failed** —
+checkout. Latest recorded result (2026-11-07): **47 passed, 0 failed** —
 see STATUS.md for the breakdown and the scenario mapping.
 
 ## Not yet here

@@ -50,6 +50,16 @@ public class HistoryStoreTests
         File.WriteAllText(Path.Combine(dir, "history.log"), string.Join("\n", lines) + "\n");
 
     [Fact]
+    public void Append_BeforeLoad_ThrowsInvalidOperation()
+    {
+        string dir = FreshDir();
+        var store = new FileHistoryStore(dir);
+        Assert.Throws<InvalidOperationException>(() =>
+            store.Append(HistoryEvent.WorkflowStarted("inst-1", "def/v1",
+                DurableExecution.Execution.Fingerprints.InputFingerprint(null))));
+    }
+
+    [Fact]
     public void AppendAndLoad_RoundtripPreservesEventsAndSequences()
     {
         string dir = FreshDir();

@@ -21,6 +21,9 @@ public static class Program
 {
     private static string _crashMode = "";
 
+    /// <summary>Serializes the fan-out branches' effects: the counters and the gateway ledger are single-threaded state, exactly as a real shared downstream would serialize on its own locks. Branch timing (the delays) stays outside this gate — that is what is parallel.</summary>
+    private static readonly object FanGate = new();
+
     public static async Task<int> Main(string[] args)
     {
         string stateDir = Environment.GetEnvironmentVariable("PROOF_STATE") ?? "./p0-state";
@@ -102,7 +105,7 @@ public static class Program
         WorkflowHost host, Counters counters, StubGateway gateway,
         string variant, string instanceId, int amount, string[] loopItems)
     {
-        string definitionId = variant switch { "v2" => "order/v2", "loop" => "loop/v1", _ => "order/v1" };
+        string definitionId = variant switch { "v2" => "order/v2", "loop" => "loop/v1", "fanout" => "fanout/v1", _ => "order/v1" };
         object workflowInput = variant == "loop" ? new { source = "static-list" } : new { amount };
 
         Console.WriteLine($"[run] workflow starting/replaying (variant={variant}, gateway={(gateway.IsIdempotent ? "idempotent" : "nonidempotent")})...");
@@ -139,6 +142,59 @@ public static class Program
                 Console.WriteLine($"[run] WORKFLOW COMPLETED (loop): processExecutions={counters.Get("processExecutions")}, distinctEffects={items.Items.Count}");
                 return null;
             });
+        }
+        else if (variant == "fanout")
+        {
+            int branch2Amount = int.TryParse(Environment.GetEnvironmentVariable("FAN_BRANCH2_AMOUNT"), out var b2)
+                ? b2 : amount + 100;
+            int[] branchAmounts = { amount, branch2Amount, amount + 200 };
+            // Branch timing is scenario scaffolding only: it stages which
+            // branches are in flight when a crash point fires. It is not
+            // workflow structure — activities, inputs and order are the same
+            // in every mode; only the clock differs.
+            int[] branchDelays = _crashMode switch
+            {
+                "fanout-kill-mid" => new[] { 0, 250, 2000 },
+                "fanout-kill-early" => new[] { 400, 250, 2000 },
+                _ => new[] { 0, 0, 0 },
+            };
+
+            outcome = await host.RunAsync(definitionId, instanceId, workflowInput, async ctx =>
+            {
+                var calls = new List<ActivityCall<string>>();
+                for (int i = 1; i <= 3; i++)
+                {
+                    int branch = i;
+                    calls.Add(new ActivityCall<string>("ChargeCard", new { amount = branchAmounts[branch - 1] },
+                        async actx =>
+                        {
+                            if (branchDelays[branch - 1] > 0)
+                                await Task.Delay(branchDelays[branch - 1]);
+                            if (_crashMode == "fanout-kill-early" && branch == 2)
+                                HardKill("fan-out: kill with every branch in flight, none completed");
+                            string txn;
+                            lock (FanGate)
+                            {
+                                counters.Bump($"fanExecutions{branch}");
+                                txn = gateway.Charge(actx.IdempotencyKey, branchAmounts[branch - 1], $"{instanceId}-fan{branch}");
+                            }
+                            // THE WINDOW, per branch (§8.1): this branch's
+                            // charge is real, but its result is not in
+                            // history yet.
+                            if (_crashMode == "fanout-kill-mid" && branch == 2)
+                                HardKill("fan-out: kill inside branch 2, after its charge, before its recording");
+                            return txn;
+                        }));
+                }
+                string[] results = await ctx.CallAllAsync(calls);
+                if (_crashMode == "fanout-after-join")
+                    HardKill("fan-out: kill after the join, before workflow completion is recorded");
+                return string.Join(",", results);
+            });
+            if (outcome == WorkflowRunOutcome.Completed)
+                Console.WriteLine($"[run] WORKFLOW COMPLETED (fanout): fanExecutions=" +
+                    $"{counters.Get("fanExecutions1")}/{counters.Get("fanExecutions2")}/{counters.Get("fanExecutions3")}, " +
+                    $"chargesApplied={counters.Get("chargesApplied")}");
         }
         else
         {

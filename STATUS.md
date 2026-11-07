@@ -6,8 +6,8 @@ not. The evidence rule (§7.2) governs every line: implemented-and-proven
 means the cited suite runs it green from a clean checkout via
 `./run-tests.sh`.
 
-**Latest recorded run: 34 tests, 34 passed, 0 failed** (13 scenario tests
-across real process kills; 21 unit tests in-process).
+**Latest recorded run: 47 tests, 47 passed, 0 failed** (16 scenario tests
+across real process kills; 31 unit tests in-process).
 
 ## P0 acceptance criteria (Foundation §14) — status
 
@@ -43,12 +43,30 @@ log, gateway ledger, items store, reconciliation report).
 | J | `ScenarioFToKTests.J_*` | Changed workflow input (amount) → fingerprint violation |
 | K | `ScenarioFToKTests.K_*` | Second host on the same state refused while the single-writer lock is held |
 
+Fan-out scenarios (new with the §5.3 fan-out — no spike counterpart; same
+harness, one workflow of three parallel ChargeCard branches with per-branch
+references and execution counters):
+
+| Suite test | What it pins |
+|---|---|
+| `ScenarioFanOutTests.L_*` | Kill mid-fan-out: branch 1 complete, branch 2 charged-but-unrecorded, branch 3 in flight → resume replays branch 1, re-executes branch 2 under its recorded key (gateway deduplicates: outcomes `charged`, `duplicate-key`), executes branch 3 once; one applied charge per branch; per-branch attempts and executions asserted separately; combined workflow result is the branches' transactions in schedule order |
+| `ScenarioFanOutTests.M_*` | Kill with every branch in flight (all scheduled + attempted, none completed, none reached the gateway) → resume executes each branch exactly once; attempts per branch go 1 → 2 without duplicating effects |
+| `ScenarioFanOutTests.N_*` | Kill after the join (all branches complete, workflow completion unrecorded), then resume with branch 2's input changed → fingerprint violation inside the fan-out, raised before any execution; nothing re-runs |
+
 Unit coverage beside the scenarios: history framing/validation rules
 (torn vs corrupt, gap, duplicate schedule, orphan completion, event after
-completion, sequence continuation across store instances), ADR-012 key
-properties (stability, hex shape, distinctness per sequence/activity/
-instance/namespace), input fingerprints, and in-process host semantics
-(resume, recorded-key reuse, violations, ownership).
+completion, sequence continuation across store instances, append before
+load refused), ADR-012 key properties (stability, hex shape, distinctness
+per sequence/activity/instance/namespace), input fingerprints, in-process
+host semantics (resume, recorded-key reuse, violations — including the
+activity-identity change at a recorded position — ownership), and the
+fan-out unit tests: result combination in schedule order against a forced
+reverse completion order, branch keys as the ADR-012 keys of their
+positions (continuing the sequence after a sequential call), partial
+completion resuming only the faulted branch under its recorded key,
+changed branch input/activity refused at resume, duplicate branches keyed
+distinctly, empty fan-out consuming no command positions, and the
+non-generic overload.
 
 ## Foundation sections → implemented / not yet
 
@@ -56,7 +74,7 @@ instance/namespace), input fingerprints, and in-process host semantics
 |---|---|
 | §2 Guarantee contract | Normative in README + code docs; enforced by scenarios B and E (both gateway modes asserted) |
 | §4 Architecture / stage A | Library core present: orchestrator context, checkpoint-by-append, recovery by replay. Stage B/C are interfaces only (`IHistoryStore` seam) |
-| §5.3 Execution model (P0 subset) | Sequential durable awaits + recorded-result replay implemented. P0 form keeps the activity body with the call; name→registry resolution and the §5.1 two-argument surface are not built. `WhenAll` fan-out is in the §5.3 P0 bullet list but is **not** in the §14 P0 acceptance set and is not implemented — recorded here as a P0-scope remainder, next after the acceptance set. Roslyn analyzers (ADR-006, Proposed) not built; replay validation is the active enforcement layer |
+| §5.3 Execution model (P0 subset) | Sequential durable awaits, recorded-result replay, and the `WhenAll` fan-out implemented (`CallAllAsync`): branches are scheduled synchronously in list order — per-branch activity identity, input fingerprint and ADR-012 key settled before any branch executes — then run concurrently, each completion recorded as it lands, results combined in schedule order regardless of completion order; proven by scenarios L/M/N and the fan-out unit tests. P0 form keeps the activity body with the call; name→registry resolution and the §5.1 two-argument surface are not built. Roslyn analyzers (ADR-006, Proposed) not built; replay validation is the active enforcement layer |
 | §6.1 Event model | Schema v1 emits the P0 subset: `WorkflowStarted`, `ActivityScheduled`, `ActivityAttemptStarted`, `ActivityCompleted`, `WorkflowCompleted`. Remaining §6.1 types are reserved for their phases. Payload separation/encryption (ADR-014/017) not built — payloads currently sit inside completion records |
 | §6.2 Checkpoint atomicity | Append+fsync per event against the file provider. Database-transaction checkpoints arrive with the SQL providers (P1) |
 | §6.3 Deterministic replay & validation | Implemented and asserted (see mapping above) |
