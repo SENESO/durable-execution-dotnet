@@ -48,8 +48,13 @@ fi
 echo "== running the suite (providers: $PROVIDERS_RAN) =="
 
 if [ -f "$RUNNER" ]; then
-  # Console-runner path (used where the vstest host cannot run).
-  "$DOTNET" exec --roll-forward LatestMajor "$RUNNER" "$TEST_DLL" "${TRAIT_ARGS[@]}"
+  # Console-runner path (used where the vstest host cannot run). The test
+  # assembly's own runtimeconfig rides along: it names both shared
+  # frameworks the suite needs (NETCore for the engine tests,
+  # AspNetCore for the dashboard's in-process TestServer) — the runner's
+  # own runtimeconfig names only the first.
+  RUNTIMECONFIG="tests/DurableExecution.Tests/bin/Release/net8.0/DurableExecution.Tests.runtimeconfig.json"
+  "$DOTNET" exec --roll-forward LatestMajor --runtimeconfig "$RUNTIMECONFIG" "$RUNNER" "$TEST_DLL" "${TRAIT_ARGS[@]}"
 else
   if [ "${#FILTER_PARTS[@]}" -eq 0 ]; then
     "$DOTNET" test DurableExecution.sln -c Release --no-build

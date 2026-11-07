@@ -210,6 +210,12 @@ internal sealed class HistoryRecordValidator
                 ReqString(el, "name", ctx);
                 break;
 
+            case HistoryEventTypes.VersionMarker:
+                ReqString(el, "changeId", ctx);
+                if (ReqLong(el, "version", ctx) < 0)
+                    throw Corrupt($"{ctx}: VersionMarker.version must be >= 0");
+                break;
+
             case HistoryEventTypes.WorkflowCompleted:
                 _workflowCompletedSeen = true;
                 break;

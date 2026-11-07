@@ -1,3 +1,4 @@
+using DurableExecution.Diagnostics;
 using DurableExecution.History;
 
 namespace DurableExecution.Execution;
@@ -29,6 +30,9 @@ public sealed class WorkflowContext
     private readonly List<HistoryEvent> _signals = new();
     private readonly Dictionary<string, int> _signalConsumption = new();
     private readonly Dictionary<string, TaskCompletionSource> _signalWaiters = new();
+    private readonly long _recordedCommandDepth;
+    private readonly Dictionary<string, int> _versionCache = new();
+    private int _markersConsumed;
     private long _commandSequence;
 
     internal WorkflowContext(string namespaceId, string instanceId, IHistoryStore store, List<HistoryEvent> history,
@@ -40,6 +44,102 @@ public sealed class WorkflowContext
         _history = history;
         _clock = clock ?? SystemWorkflowClock.Instance;
         _signals.AddRange(history.Where(e => e.Type == HistoryEventTypes.SignalReceived));
+        _recordedCommandDepth = history
+            .Where(e => e.CommandSequence is not null)
+            .Select(e => e.CommandSequence!.Value)
+            .DefaultIfEmpty(0)
+            .Max();
+    }
+
+    /// <summary>The version a gate reports while the code around it still predates the gate: <c>-1</c>.</summary>
+    public const int DefaultVersion = -1;
+
+    /// <summary>
+    /// The P4 code-version gate: the safe way to change a workflow's code
+    /// after instances of it exist. The first time a run reaches this call
+    /// <i>live</i> (past the end of everything history recorded), it appends
+    /// a <c>VersionMarker</c> recording <paramref name="maxSupported"/> for
+    /// <paramref name="changeId"/> and returns it. On replay, the recorded
+    /// marker is returned instead — so the branch taken is the branch that
+    /// was recorded, on the first run and every resume alike:
+    ///
+    /// <list type="bullet">
+    /// <item>A recorded version outside
+    /// [<paramref name="minSupported"/>..<paramref name="maxSupported"/>]
+    /// refuses the run with <see cref="VersionGateException"/> before
+    /// anything executes: this code is the wrong version for that
+    /// instance.</item>
+    /// <item>A call reached while replay is still inside recorded commands
+    /// that predate the gate (the gate was inserted before work that
+    /// already happened) records nothing and returns
+    /// <see cref="DefaultVersion"/>: the pre-gate branch is the correct one
+    /// for that history, and the marker is recorded when the same call is
+    /// later reached live.</item>
+    /// <item>Markers are consumed in recorded order, matched by change id:
+    /// a gate whose recorded counterpart names a different change was
+    /// removed or reordered, a <see cref="NonDeterminismViolationException"/>.
+    /// Changing the workflow around a gate — renaming the activity at a
+    /// recorded position, changing its input — stays a determinism
+    /// violation exactly as without gates; the gate is how a change is
+    /// made <i>legible</i> to replay, not a licence to rewrite it.</item>
+    /// </list>
+    ///
+    /// Repeated calls with the same change id in one run return the same
+    /// version. Gates take no command position: they consume the marker
+    /// stream, not the command stream.
+    /// </summary>
+    public int GetVersion(string changeId, int minSupported, int maxSupported)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(changeId);
+        if (minSupported < 0)
+            throw new ArgumentOutOfRangeException(nameof(minSupported), "supported versions start at 0");
+        if (maxSupported < minSupported)
+            throw new ArgumentOutOfRangeException(nameof(maxSupported), "maxSupported cannot be below minSupported");
+
+        lock (_appendGate)
+        {
+            if (_versionCache.TryGetValue(changeId, out int cached))
+                return cached;
+
+            var markers = _history.Where(e => e.Type == HistoryEventTypes.VersionMarker).ToList();
+            int version;
+            if (_markersConsumed < markers.Count)
+            {
+                var marker = markers[_markersConsumed];
+                string recordedId = marker.GetString("changeId")!;
+                int recorded = (int)marker.GetInt64("version")!;
+                if (recordedId != changeId)
+                    throw new NonDeterminismViolationException(
+                        $"version marker #{_markersConsumed + 1} was recorded for change '{recordedId}' " +
+                        $"but the code now asks for change '{changeId}' at that position — a gate was removed or reordered");
+                _markersConsumed++;
+                if (recorded < minSupported || recorded > maxSupported)
+                    throw new VersionGateException(changeId, recorded, minSupported, maxSupported);
+                version = recorded;
+            }
+            else if (_commandSequence < _recordedCommandDepth)
+            {
+                // Still replaying commands that were recorded before this
+                // gate existed: the pre-gate branch is the recorded truth
+                // for this part of the history. Record nothing.
+                version = DefaultVersion;
+            }
+            else
+            {
+                AppendLocked(HistoryEvent.VersionMarker(_instanceId, changeId, maxSupported));
+                _markersConsumed++;
+                version = maxSupported;
+            }
+
+            // Resolved versions (recorded or newly recorded) are stable for
+            // the rest of the run and cached. DefaultVersion is not: it is a
+            // statement about this call's position inside pre-gate history,
+            // and the same change id asked again after replay catches up
+            // must resolve live.
+            if (version != DefaultVersion)
+                _versionCache[changeId] = version;
+            return version;
+        }
     }
 
     /// <summary>The engine clock this context waits on (retry backoff, timers).</summary>
@@ -318,7 +418,30 @@ public sealed class WorkflowContext
     /// <see cref="ActivityFailedException"/> without executing again,
     /// on the first run and on every resume alike.
     /// </summary>
+    /// <summary>
+    /// The telemetry wrapper over one command's execution: an Activity
+    /// span per execution (retries included) and the executions counter,
+    /// recorded by outcome. Replayed completions never reach this method.
+    /// </summary>
     private async Task<T> ExecuteAsync<T>(CommandSlot slot, string activity, Func<ActivityContext, Task<T>> body,
+        RetryPolicy? retryPolicy)
+    {
+        using var span = EngineDiagnostics.StartActivitySpan(activity, slot.Sequence, _instanceId);
+        try
+        {
+            var result = await ExecuteWithRetriesAsync(slot, activity, body, retryPolicy);
+            EngineDiagnostics.RecordActivityExecution(activity, _instanceId, "completed");
+            return result;
+        }
+        catch (Exception e)
+        {
+            span?.SetStatus(System.Diagnostics.ActivityStatusCode.Error, e.Message);
+            EngineDiagnostics.RecordActivityExecution(activity, _instanceId, "failed");
+            throw;
+        }
+    }
+
+    private async Task<T> ExecuteWithRetriesAsync<T>(CommandSlot slot, string activity, Func<ActivityContext, Task<T>> body,
         RetryPolicy? retryPolicy)
     {
         long RecordedFailures() => _history.Count(e =>

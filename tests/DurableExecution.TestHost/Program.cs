@@ -49,28 +49,40 @@ public static class Program
             // is identical, so a scenario's evidence differs only in the
             // persistence medium it claims to cover.
             IHistoryStore store;
+            // Payload encryption is a store option supplied the deployment
+            // way: the key arrives in DE_HISTORY_ENCRYPTION_KEY and nowhere
+            // else; a malformed key refuses the run at startup.
+            var encryption = HistoryEncryption.FromEnvironment();
             string historyProvider = Environment.GetEnvironmentVariable("HISTORY_PROVIDER") ?? "file";
             if (historyProvider == "sqlserver")
             {
                 string connection = Environment.GetEnvironmentVariable("HISTORY_SQLSERVER_CONNECTION")
                     ?? throw new InvalidOperationException(
                         "HISTORY_SQLSERVER_CONNECTION is required for the sqlserver provider");
-                store = new SqlHistoryStore(connection, instanceId, new TornWriteInjector(), snapshotInterval);
+                store = new SqlHistoryStore(connection, instanceId, new TornWriteInjector(), snapshotInterval, encryption);
             }
             else if (historyProvider == "postgresql")
             {
                 string connection = Environment.GetEnvironmentVariable("HISTORY_POSTGRES_CONNECTION")
                     ?? throw new InvalidOperationException(
                         "HISTORY_POSTGRES_CONNECTION is required for the postgresql provider");
-                store = new PostgresHistoryStore(connection, instanceId, new TornWriteInjector(), snapshotInterval);
+                store = new PostgresHistoryStore(connection, instanceId, new TornWriteInjector(), snapshotInterval, encryption);
             }
             else if (historyProvider == "sqlite")
             {
-                store = new SqliteHistoryStore(stateDir, new TornWriteInjector(), snapshotInterval);
+                store = new SqliteHistoryStore(stateDir, new TornWriteInjector(), snapshotInterval, encryption);
             }
             else
             {
-                store = new FileHistoryStore(stateDir, new TornWriteInjector(), snapshotInterval);
+                store = new FileHistoryStore(stateDir, new TornWriteInjector(), snapshotInterval, encryption);
+            }
+            if (int.TryParse(Environment.GetEnvironmentVariable("CRASH_SEED"), out int crashSeed))
+            {
+                // Seeded randomized kill scheduling: this run's kill point
+                // is a pure function of (seed, run index), printed before
+                // it fires, so any failing seed reproduces exactly.
+                int crashRun = int.TryParse(Environment.GetEnvironmentVariable("CRASH_RUN"), out var cr) ? cr : 0;
+                store = new SeededKillStore(store, crashSeed, crashRun);
             }
             if (args.Contains("send-signal"))
             {
@@ -132,6 +144,11 @@ public static class Program
             Console.WriteLine($"[replay] NONDETERMINISM VIOLATION: {e.Message} — halting");
             return 4;
         }
+        catch (VersionGateException e)
+        {
+            Console.WriteLine($"[version] VERSION GATE REFUSAL: {e.Message}");
+            return 7;
+        }
         catch (StateOwnedByAnotherHostException e)
         {
             Console.WriteLine($"[lock] {e.Message}");
@@ -154,6 +171,58 @@ public static class Program
         Console.WriteLine($"[CRASH] hard kill injected: {where}");
         Console.Out.Flush();
         System.Diagnostics.Process.GetCurrentProcess().Kill();
+    }
+
+    /// <summary>
+    /// The seeded random killer: wraps the run's store and hard-kills the
+    /// process immediately before the Nth append, where N is drawn from
+    /// <c>Random(seed * 31 + runIndex)</c> in [1..6] — a pure function of
+    /// the run's env, so the kill schedule of any seed is reproducible
+    /// exactly by re-running the same (seed, run) pair. Kills land at
+    /// append boundaries; the mid-write tear is scenario D's injector.
+    /// The seed and run are printed on the kill line before the process
+    /// dies, so a red run names its own reproduction.
+    /// </summary>
+    private sealed class SeededKillStore : IHistoryStore, IHistorySnapshotStore, IHistoryKeyRetention, IDisposable
+    {
+        private readonly IHistoryStore _inner;
+        private readonly int _seed;
+        private readonly int _run;
+        private readonly int _killBeforeAppend;
+        private int _appends;
+
+        public SeededKillStore(IHistoryStore inner, int seed, int run)
+        {
+            _inner = inner;
+            _seed = seed;
+            _run = run;
+            _killBeforeAppend = new Random(unchecked(seed * 31 + run)).Next(1, 7);
+        }
+
+        public HistoryLoadResult Load() => _inner.Load();
+
+        public HistorySnapshotLoadResult LoadFromSnapshot() =>
+            ((IHistorySnapshotStore)_inner).LoadFromSnapshot();
+
+        public HistoryEvent Append(HistoryEvent historyEvent)
+        {
+            int n = ++_appends;
+            if (n == _killBeforeAppend)
+            {
+                Console.WriteLine(
+                    $"[CRASH] seeded kill: seed={_seed} run={_run} — hard kill before append #{n} ({historyEvent.Type})");
+                Console.Out.Flush();
+                System.Diagnostics.Process.GetCurrentProcess().Kill();
+            }
+            return _inner.Append(historyEvent);
+        }
+
+        public IReadOnlyDictionary<long, string> RecordedKeys => ((IHistoryKeyRetention)_inner).RecordedKeys;
+        public DateTimeOffset? CompletedAtUtc => ((IHistoryKeyRetention)_inner).CompletedAtUtc;
+        public bool KeyOnRecord(string idempotencyKey) => ((IHistoryKeyRetention)_inner).KeyOnRecord(idempotencyKey);
+        public int PurgeExpiredKeys(DateTimeOffset utcNow) => ((IHistoryKeyRetention)_inner).PurgeExpiredKeys(utcNow);
+
+        public void Dispose() => (_inner as IDisposable)?.Dispose();
     }
 
     /// <summary>Tears the write of the first command's completion, then dies — the §7.1 mid-write kill point.</summary>
@@ -331,6 +400,41 @@ public static class Program
             {
                 if (variant == "v2")
                 {
+                    await Call(ctx, "ReserveStock", new { orderId = instanceId }, ReserveStock(counters));
+                    charge = await Call(ctx, "ChargeCard", new { amount }, ChargeCard(counters, gateway, amount, instanceId));
+                }
+                else if (variant == "versioned" || variant == "versioned-capped")
+                {
+                    // The P4 shape: same definition id (order/v1), code
+                    // changed under a gate. The gate sits after the first
+                    // command; from version 2 on, ReserveStock is called
+                    // with a priority input the old code never sent.
+                    charge = await Call(ctx, "ChargeCard", new { amount }, ChargeCard(counters, gateway, amount, instanceId));
+                    int version = variant == "versioned"
+                        ? ctx.GetVersion("reserve-v2", 1, 2)
+                        : ctx.GetVersion("reserve-v2", 1, 1);
+                    Console.WriteLine($"[version] gate 'reserve-v2' resolved to version {version}");
+                    object reserveInput = variant == "versioned" && version >= 2
+                        ? new { orderId = instanceId, priority = "high" }
+                        : new { orderId = instanceId };
+                    await Call(ctx, "ReserveStock", reserveInput, ReserveStock(counters));
+                }
+                else if (variant == "versioned-early")
+                {
+                    // The gate was inserted BEFORE the first command and the
+                    // body ignores it (the pre-gate code path): over history
+                    // recorded by ungated code it must resolve to the
+                    // default version and record nothing.
+                    int version = ctx.GetVersion("reserve-v2", 1, 2);
+                    Console.WriteLine($"[version] gate 'reserve-v2' resolved to version {version}");
+                    charge = await Call(ctx, "ChargeCard", new { amount }, ChargeCard(counters, gateway, amount, instanceId));
+                    await Call(ctx, "ReserveStock", new { orderId = instanceId }, ReserveStock(counters));
+                }
+                else if (variant == "mutated")
+                {
+                    // The ungated change: same definition id, but the
+                    // recorded first command is silently swapped. Replay
+                    // must refuse it as a determinism violation.
                     await Call(ctx, "ReserveStock", new { orderId = instanceId }, ReserveStock(counters));
                     charge = await Call(ctx, "ChargeCard", new { amount }, ChargeCard(counters, gateway, amount, instanceId));
                 }

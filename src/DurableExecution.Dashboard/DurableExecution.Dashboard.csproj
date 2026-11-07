@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DurableExecution.Core\DurableExecution.Core.csproj" />
+    <ProjectReference Include="..\DurableExecution.SqlServer\DurableExecution.SqlServer.csproj" />
+    <ProjectReference Include="..\DurableExecution.PostgreSql\DurableExecution.PostgreSql.csproj" />
+    <ProjectReference Include="..\DurableExecution.Sqlite\DurableExecution.Sqlite.csproj" />
+  </ItemGroup>
+
+</Project>

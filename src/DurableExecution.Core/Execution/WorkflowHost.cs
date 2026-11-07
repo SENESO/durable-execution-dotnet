@@ -1,3 +1,4 @@
+using DurableExecution.Diagnostics;
 using DurableExecution.History;
 
 namespace DurableExecution.Execution;
@@ -79,6 +80,26 @@ public sealed class WorkflowHost : IDisposable
         object? input,
         Func<WorkflowContext, Task<object?>> body)
     {
+        using var span = EngineDiagnostics.StartWorkflowSpan(definitionId, instanceId);
+        try
+        {
+            return await RunCoreAsync(definitionId, instanceId, input, body, span);
+        }
+        catch (Exception e)
+        {
+            span?.SetStatus(System.Diagnostics.ActivityStatusCode.Error, e.Message);
+            EngineDiagnostics.RecordWorkflowRun(instanceId, "failed");
+            throw;
+        }
+    }
+
+    private async Task<WorkflowRunOutcome> RunCoreAsync(
+        string definitionId,
+        string instanceId,
+        object? input,
+        Func<WorkflowContext, Task<object?>> body,
+        System.Diagnostics.Activity? span)
+    {
         HistoryLoadResult load;
         if (_store is IHistorySnapshotStore snapshotStore)
         {
@@ -108,7 +129,11 @@ public sealed class WorkflowHost : IDisposable
                 throw new NonDeterminismViolationException(
                     "workflow input fingerprint changed since the workflow started");
             if (history.Any(e => e.Type == HistoryEventTypes.WorkflowCompleted))
+            {
+                span?.SetTag("durableexecution.outcome", "already_completed");
+                EngineDiagnostics.RecordWorkflowRun(instanceId, "already_completed");
                 return WorkflowRunOutcome.AlreadyCompleted;
+            }
         }
         else
         {
@@ -122,6 +147,8 @@ public sealed class WorkflowHost : IDisposable
         {
             object? result = await body(context);
             _store.Append(HistoryEvent.WorkflowCompleted(instanceId, result));
+            span?.SetTag("durableexecution.outcome", "completed");
+            EngineDiagnostics.RecordWorkflowRun(instanceId, "completed");
             return WorkflowRunOutcome.Completed;
         }
         finally
@@ -146,6 +173,26 @@ public sealed class WorkflowHost : IDisposable
                 "no workflow run is active on this host — a signal for a non-running workflow is " +
                 "appended to its history store before the run starts, and delivered from history");
         context.DeliverSignal(name, payload);
+    }
+
+    /// <summary>
+    /// The §8.5 retention sweep point: purges this instance's
+    /// idempotency keys when the store's configured retention policy
+    /// says they have expired at <paramref name="utcNow"/>, returning
+    /// how many keys were removed (0 while retention has not elapsed,
+    /// while the instance has not completed, or after a previous
+    /// purge). This is the host-driven sweep the design names: the
+    /// operator's host calls it on its own schedule — the engine runs
+    /// no background thread and hides no sweep behaviour. History is
+    /// never touched by a purge.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The store keeps no key registry, or has no retention policy configured.</exception>
+    public int PurgeExpiredKeys(DateTimeOffset utcNow)
+    {
+        if (_store is not IHistoryKeyRetention retention)
+            throw new InvalidOperationException(
+                "this host's history store does not maintain an idempotency key registry");
+        return retention.PurgeExpiredKeys(utcNow);
     }
 
     /// <summary>

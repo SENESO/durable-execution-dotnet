@@ -5,8 +5,15 @@ namespace DurableExecution.Tests;
 /// <summary>The result of one scenario-host process run.</summary>
 public sealed record HostRun(int ExitCode, string Output)
 {
-    /// <summary>True when the run was hard-killed at a crash point (SIGKILL), not exited.</summary>
-    public bool WasKilled => (ExitCode == 137 || ExitCode == -9) && Output.Contains("[CRASH]");
+    /// <summary>
+    /// True when the run was hard-killed at a crash point, not exited. The
+    /// exit code of a self-<see cref="Process.Kill()"/> is platform-shaped:
+    /// -9 (or a shell's 137) on Unix, -1 on Windows — the [CRASH] marker in
+    /// the output is what proves the kill landed at the crash point.
+    /// </summary>
+    public bool WasKilled =>
+        (ExitCode == 137 || ExitCode == -9 || (OperatingSystem.IsWindows() && ExitCode == -1))
+        && Output.Contains("[CRASH]");
 }
 
 /// <summary>

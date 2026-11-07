@@ -13,8 +13,12 @@ history instead of starting over or stopping half-done.
 This repository is **stage A (the embeddable library)**: the durable
 execution core (phase P0), plus the P1 provider and snapshot work — four
 history providers (file, SQL Server, PostgreSQL, SQLite) and sealed
-history snapshots — and the P2 core: activity retry policies, durable
-timers, and signals, each admitted through the §6.5 conformance gate. It is built under one
+history snapshots — the P2 core: activity retry policies, durable
+timers, and signals — and the final completion wave: payload encryption
+at rest, §8.5 idempotency-key expiry, code-version gates, per-instance
+lease fencing, OpenTelemetry instrumentation, seeded randomized kill
+scheduling, and an operator dashboard — each admitted through the §6.5
+conformance gate. It is built under one
 governing rule, taken from the Engineering Foundation (§7.2): **no phase
 advances on "the code works" — a phase advances only on reproducible test
 evidence.** The evidence command is `./run-tests.sh`; the current results
@@ -100,6 +104,33 @@ substance because every other claim in this repository is bounded by it.
   is corruption and is refused loudly — never silently bypassed; the suite
   proves snapshot + tail reconstruction identical to full replay, per
   provider.
+- **Payload encryption at rest**: an opt-in per store — every history
+  record (and snapshot) is sealed as an AES-256-GCM envelope, checksum
+  over the ciphertext, key supplied only through the
+  `DE_HISTORY_ENCRYPTION_KEY` environment variable. A missing or wrong
+  key, a flipped ciphertext bit, or an encryption-mode mismatch against
+  an existing history is a loud refusal — never a silent plaintext
+  fallback.
+- **Key expiry (§8.5)**: a store may carry a retention policy for the
+  derived idempotency-key registry of completed instances; an explicit
+  purge (host-exposed, no background thread) retires keys after the
+  window while histories stay fully valid — history itself is never
+  purged.
+- **Version gates**: `GetVersion(changeId, minSupported, maxSupported)`
+  records `VersionMarker` events; resuming a history whose recorded
+  marker falls outside the running code's range is a named refusal, and
+  changing a workflow without a gate is caught by replay validation.
+- **Lease fencing**: opt-in per store — a per-instance lease with a
+  monotonic fencing token, verified inside every append; a stale writer
+  is refused loudly. Cooperative within one store; it is not
+  cross-database consensus, and STATUS.md says so in as many words.
+- **OpenTelemetry**: an `ActivitySource` and a `Meter` named
+  `DurableExecution` over workflow runs, activity executions, and store
+  appends.
+- **Operator dashboard** (`src/DurableExecution.Dashboard`): instance
+  list with history-derived status, a detail view rendered from the
+  store's validating load (a refused history shows as corrupt, with the
+  refusal), and signal sending through the store's own append path.
 - **The crash-injection suite** (§7): a scriptable payment-gateway stub in
   idempotent and non-idempotent modes, a resumable reconciliation command,
   and 11 scenarios (A–K) executed across real process kills, plus three
@@ -125,14 +156,16 @@ workflow.
 
 ```
 src/DurableExecution.Core/        the library (stage A core)
-  History/                        event model, store seam, file provider, shared record validation
+  History/                        event model, store seam, file provider, shared record validation, encryption, key retention, fencing
   Execution/                      host, workflow context, identity, fingerprints
+  Diagnostics/                    OpenTelemetry ActivitySource + Meter
   IO/                             atomic durable file writes
 src/DurableExecution.SqlServer/   SQL Server history provider (P1)
 src/DurableExecution.PostgreSql/  PostgreSQL history provider (P1)
 src/DurableExecution.Sqlite/      SQLite history provider (P1)
+src/DurableExecution.Dashboard/   ASP.NET Core operator dashboard (any provider)
 tests/DurableExecution.TestHost/  scenario host process the suite kills/restarts
-tests/DurableExecution.Tests/     xUnit: Scenarios (A–K, fan-out L–N) + Unit (store, keys, host, fan-out, snapshots), each run per provider
+tests/DurableExecution.Tests/     xUnit: Scenarios (A–K, fan-out L–N, retries O, timers P, signals Q, version gates R, seeded kills) + Unit (store, keys, host, fan-out, snapshots, encryption, retention, fencing, telemetry, dashboard), each run per provider
 ```
 
 `IHistoryStore` is the seam the distributed runtime (stage B) and the
@@ -141,8 +174,9 @@ contract (Foundation §6.5) before it may ship. The database providers store
 the identical sealed records as rows in a caller-provisioned database —
 one serializable transaction per append, and an in-database lock as the
 single-writer mechanism (SQL Server session application lock, PostgreSQL
-advisory lock — cooperative, within one database; cross-device fencing
-remains a later phase and is not claimed). The SQLite provider is the
+advisory lock — cooperative, within one database; optional lease
+fencing with monotonic tokens builds on the same boundary, and
+cross-database consensus is not claimed). The SQLite provider is the
 embedded form: one database file per state directory, an OS lock file as
 its single-writer mechanism.
 
@@ -158,14 +192,17 @@ always, and the SQL Server / PostgreSQL providers too when
 `DE_SQLSERVER_CONNECTION` / `DE_POSTGRES_CONNECTION` name a test server
 (the suite provisions and drops one scratch database per test; no
 connection string lives in the repository). Latest recorded results
-(2026-11-07): **133 passed, 0 failed** with the no-server gate (file +
-SQLite), and **265 passed, 0 failed** with all four providers — see
+(2026-11-07): **266 passed, 0 failed** with the no-server gate (file +
+SQLite), and **524 passed, 0 failed** with all four providers — see
 STATUS.md for the breakdown, the scenario mapping, and the conformance
 matrix.
 
 ## Not yet here
 
-Distributed leases and fencing, version gates, payload encryption and
-crypto-erasure, the dashboard. Each is a named phase or a named gap with its
-acceptance criteria in the Engineering Foundation; STATUS.md tracks them
-individually. Nothing in this list is claimed by this code.
+Real power-loss proof (needs a machine whose power can actually be
+cut), cross-database consensus and the stage-B/C distributed runtime
+beyond single-store fencing, sub-workflow event types, side-effect
+machinery beyond keys and reconciliation-by-command, a golden-history
+corpus, crypto-erasure of whole histories, and benchmarks. STATUS.md
+tracks each of them individually. Nothing in this list is claimed by
+this code.

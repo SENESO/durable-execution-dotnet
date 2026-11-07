@@ -11,6 +11,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
+    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="8.0.10" />
     <PackageReference Include="xunit" Version="2.5.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.5.3" />
   </ItemGroup>
@@ -20,10 +21,16 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The dashboard tests host the web app in-process (WebApplicationFactory). -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\DurableExecution.Core\DurableExecution.Core.csproj" />
     <ProjectReference Include="..\..\src\DurableExecution.SqlServer\DurableExecution.SqlServer.csproj" />
     <ProjectReference Include="..\..\src\DurableExecution.PostgreSql\DurableExecution.PostgreSql.csproj" />
     <ProjectReference Include="..\..\src\DurableExecution.Sqlite\DurableExecution.Sqlite.csproj" />
+    <ProjectReference Include="..\..\src\DurableExecution.Dashboard\DurableExecution.Dashboard.csproj" />
     <!-- Builds the scenario host executable; the tests drive it as a child
          process. It is not referenced as a library. -->
     <ProjectReference Include="..\DurableExecution.TestHost\DurableExecution.TestHost.csproj">

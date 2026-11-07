@@ -21,7 +21,11 @@ public interface IStoreFactory : IDisposable
 /// <summary>The file provider's factory: a store over the test's state directory.</summary>
 public sealed class FileStoreFactory : IStoreFactory
 {
-    public IHistoryStore CreateStore(string stateDir) => new FileHistoryStore(stateDir);
+    private readonly HistoryEncryption? _encryption;
+
+    public FileStoreFactory(HistoryEncryption? encryption = null) => _encryption = encryption;
+
+    public IHistoryStore CreateStore(string stateDir) => new FileHistoryStore(stateDir, encryption: _encryption);
 
     public void Dispose() { }
 }
@@ -34,8 +38,11 @@ public sealed class FileStoreFactory : IStoreFactory
 public sealed class SqlStoreFactory : IStoreFactory
 {
     private readonly (string Name, string Connection) _database = SqlTestDatabases.CreateDatabase("unit");
+    private readonly HistoryEncryption? _encryption;
 
-    public IHistoryStore CreateStore(string stateDir) => new SqlHistoryStore(_database.Connection, "order-1001");
+    public SqlStoreFactory(HistoryEncryption? encryption = null) => _encryption = encryption;
+
+    public IHistoryStore CreateStore(string stateDir) => new SqlHistoryStore(_database.Connection, "order-1001", encryption: _encryption);
 
     public void Dispose()
     {
@@ -53,8 +60,11 @@ public sealed class SqlStoreFactory : IStoreFactory
 public sealed class PostgresStoreFactory : IStoreFactory
 {
     private readonly (string Name, string Connection) _database = PostgresTestDatabases.CreateDatabase("unit");
+    private readonly HistoryEncryption? _encryption;
 
-    public IHistoryStore CreateStore(string stateDir) => new PostgresHistoryStore(_database.Connection, "order-1001");
+    public PostgresStoreFactory(HistoryEncryption? encryption = null) => _encryption = encryption;
+
+    public IHistoryStore CreateStore(string stateDir) => new PostgresHistoryStore(_database.Connection, "order-1001", encryption: _encryption);
 
     public void Dispose()
     {
@@ -66,7 +76,11 @@ public sealed class PostgresStoreFactory : IStoreFactory
 /// <summary>The SQLite provider's factory: a store over the test's state directory.</summary>
 public sealed class SqliteStoreFactory : IStoreFactory
 {
-    public IHistoryStore CreateStore(string stateDir) => new SqliteHistoryStore(stateDir);
+    private readonly HistoryEncryption? _encryption;
+
+    public SqliteStoreFactory(HistoryEncryption? encryption = null) => _encryption = encryption;
+
+    public IHistoryStore CreateStore(string stateDir) => new SqliteHistoryStore(stateDir, encryption: _encryption);
 
     public void Dispose() { }
 }

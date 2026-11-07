@@ -6,13 +6,13 @@ not. The evidence rule (§7.2) governs every line: implemented-and-proven
 means the cited suite runs it green from a clean checkout via
 `./run-tests.sh`.
 
-**Latest recorded runs (2026-11-07, after the P1 completion sweep and
-the P2 core): 133 tests, 133 passed, 0 failed** with `./run-tests.sh`
-(the file and SQLite providers — the no-server gate), and **265 tests,
-265 passed, 0 failed** with both `DE_SQLSERVER_CONNECTION` and
+**Latest recorded runs (2026-11-07, after the final completion wave
+below): 266 tests, 266 passed, 0 failed** with `./run-tests.sh`
+(the file and SQLite providers — the no-server gate), and **524 tests,
+524 passed, 0 failed** with both `DE_SQLSERVER_CONNECTION` and
 `DE_POSTGRES_CONNECTION` set against test servers — the same suite run
-per provider under the §6.5 conformance gate (see the P1 and P2
-sections below for the coverage matrix).
+per provider under the §6.5 conformance gate (see the P1, P2, and
+final-wave sections below for the coverage matrices).
 
 ## P0 acceptance criteria (Foundation §14) — status
 
@@ -300,6 +300,152 @@ Updated totals (the P1 matrix plus P2):
 | Scenario Q (signal, killed while waiting) | 1 | 1 | 1 | 1 |
 | **Totals** | **69** | **68** | **64** | **64** |
 
+## Final completion wave — encryption, key expiry, version gates, fencing, telemetry, seeded kills, dashboard
+
+Delivered 2026-11-07, in this order, each item gated on the full
+four-provider suite before the next began (gate totals as each item
+landed: 421 → 441 → 497 → 513 → 514 → 518 → 524).
+
+**Payload encryption at rest (ADR-014/017).** Each store takes an
+optional `HistoryEncryption` (default off — existing plaintext
+histories keep loading). When on, every record's payload is sealed as
+an envelope: AES-256-GCM (12-byte nonce, 16-byte tag, AAD binding the
+record format), stored as `{v, enc, kid, nonce, ct, sum}` where `kid`
+is the first 16 hex of the key's SHA-256 and `sum` is the existing
+history checksum computed **over the envelope** — seal over
+ciphertext, so integrity is verified before any decryption is
+attempted. Snapshots ride the same envelope. The key comes only from
+the `DE_HISTORY_ENCRYPTION_KEY` environment variable (base64,
+32 bytes); unset means off, malformed means a loud refusal at
+startup. Cross-mode opens are refused both ways (encrypted store over
+a plaintext history, and the reverse), a wrong key is refused by its
+key id, a flipped ciphertext bit is refused by the checksum, and a
+forged envelope with a recomputed checksum is refused by GCM
+authentication. Proof: the host scenario suite runs with encryption on
+for every provider (20 derived classes), plus store-level encryption
+tests and process-level encrypted crash scenarios per provider.
+Named adaptation: the store-conformance and snapshot suites have no
+encrypted variants — their damage helpers splice plaintext records,
+which an encrypted history refuses by design; the encrypted damage
+model (tamper, wrong key, cross-mode, snapshot envelope) is covered
+by the dedicated encryption tests instead.
+
+**§8.5 idempotency-key expiry.** Keys are ADR-012 derivations recorded
+in history, and history is never purged — what expires is the
+*enforcement registry* each store derives beside the history: seq →
+key plus the instance's completion time, folded from history on load,
+maintained inside each append's commit unit, and persisted (file: a
+sealed `history.keys.json`; SQL Server: `dbo.HistoryKeys` +
+`dbo.HistoryInstanceState`; PostgreSQL and SQLite: the same tables in
+their stores). A store configured with a `KeyRetentionPolicy`
+(retention window) offers `PurgeExpiredKeys(now)`: for instances
+completed longer than the window, registry rows are deleted and a
+purge marker is recorded so a later load does not resurrect them —
+safe because completion is terminal, so no append can ever need those
+keys again, and the history itself stays fully valid and readable
+(it is never touched). The host exposes the sweep as
+`WorkflowHost.PurgeExpiredKeys(utcNow)` — an explicit call, no
+background thread. Without a configured policy the purge refuses.
+Per provider: registry fidelity against history, dedup intact before
+expiry, purge after it, uncompleted instances untouched, refusal
+without a policy, no resurrection across reload.
+
+**Code-version gates (P4 core).** A new history event,
+`VersionMarker`, records gate resolutions. `WorkflowContext.GetVersion
+(changeId, minSupported, maxSupported)`: on the live pass it appends a
+marker at `maxSupported`; on replay it consumes markers in order —
+recorded version inside the range returns it, outside refuses with a
+named `VersionGateException`; a marker whose changeId does not match
+the gate at that position is a determinism violation. A gate the old
+code never had (an early-instance history with recorded commands after
+the gate's position but no marker) resolves to the documented default
+−1 and records nothing, so pre-gate code keeps its old behaviour
+explicitly instead of silently adopting the new default. Markers fold
+through snapshots like any other fact. Proof per provider: gate unit
+tests (live resolution, in-range/out-of-range resume, marker folding)
+and scenarios R1–R4 — gated resume records the marker and charges
+once, an ungated edit to a live workflow body is a determinism
+violation on replay, a host whose range no longer covers the recorded
+marker refuses before executing anything.
+
+**Fencing (P3 core).** Opt-in per store (`FencingOptions`: lease
+duration, owner id). Load acquires the instance's lease — a stored
+record of owner, **monotonic token**, and expiry (file: sealed
+`history.lease.json` under a lock-file guard; SQL Server:
+`dbo.HistoryLeases`; PostgreSQL: `public.history_leases`; SQLite:
+`HistoryLeases`) — bumping the token on every takeover, renewing
+without a bump for the same owner, and refusing a live foreign lease
+with `StateOwnedByAnotherHostException`. Every append re-verifies
+owner + token + unexpired lease *inside the append's own transaction*;
+a stale writer is refused with `StaleFencingTokenException`. Proof per
+provider: takeover after expiry bumps the token and the stale owner's
+next append is refused while the history stays sealed-valid; expiry
+alone (no rival) fences the original owner. **What this does not
+solve, stated plainly:** it is cooperative fencing inside one store —
+a writer that bypasses the store API is caught only by the seal and
+end-of-history checks; there is no cross-database consensus and no
+distributed runtime here; lease expiry runs on the store's clock, so
+clock skew shifts takeover timing; on the file provider the lease
+check and the append are two writes, not one transaction (the
+end-check narrows, not eliminates, that window).
+
+**OpenTelemetry.** `EngineDiagnostics` owns an `ActivitySource` and a
+`Meter`, both named `DurableExecution`: spans for workflow runs
+(definition, instance, outcome tags), per-activity executions
+(including retries), and every store append (store, event type,
+instance tags); counters for store appends, workflow runs, and
+activity executions. No new packages — the BCL diagnostics APIs.
+Overhead, honestly: with no listener attached the calls are near-free
+(an enabled check and a no-op span); with a listener/exporter attached
+the cost is the standard OpenTelemetry cost of span and measurement
+creation — it is not claimed to be zero. Proof: an in-memory
+listener test asserting the span names/tags and measurement names/tags
+for a real two-activity run.
+
+**Seeded randomized kills (§7 harness growth).** The scenario host
+takes `CRASH_SEED` (+ `CRASH_RUN` for the run index): a decorating
+store kills the process before append N, N drawn from
+`Random(seed * 31 + run)` in [1, 6] of the reference workflow's 8
+appends — kills land at append boundaries; mid-write tearing remains
+scenario D's ground. The test runs seeds 1–6 on every provider,
+asserting run 0 is always killed at the drawn point and that the
+resume loop converges to exactly one applied charge with a sealed,
+complete history. Reproduction is the schedule itself: the same seed
+and run index draw the same kill point, printed in the host's output.
+
+**Dashboard.** `src/DurableExecution.Dashboard` — a minimal ASP.NET
+Core operator app over any provider (`DE_DASHBOARD_PROVIDER`,
+`DE_DASHBOARD_STATE_ROOT`, the providers' usual connection variables;
+encryption follows `DE_HISTORY_ENCRYPTION_KEY`). The instance list
+derives each status from its sealed history through a validating
+load; the detail page renders that verified event list; a history the
+store refuses renders as CORRUPT with the refusal text and no event
+table — never a partial view. Sending a signal appends
+`SignalReceived` through the store's own append path; a completed
+instance refuses signals loudly (nothing may follow
+`WorkflowCompleted`). HTTP tests host the app's real route table on
+TestServer (real HTTP semantics, no sockets — this sandbox's
+permission layer denies loopback TCP from test processes; the
+standalone app was additionally smoke-verified over real HTTP: list,
+signal POST, detail). `run-tests.sh` now passes the test assembly's
+runtimeconfig to the console runner so the ASP.NET Core framework
+resolves under it.
+
+Updated totals (P2 matrix plus the final wave):
+
+| Evidence | File | SQL Server | PostgreSQL | SQLite |
+|---|---|---|---|---|
+| P2 totals | 69 | 68 | 64 | 64 |
+| Encryption: encrypted host-suite variants | 28 | 28 | 28 | 28 |
+| Encryption: store-level + process scenarios | 11 | 11 | 11 | 11 |
+| Key-retention (§8.5) tests | 5 | 5 | 5 | 5 |
+| Version-gate tests + scenarios R1–R4 | 14 | 14 | 14 | 14 |
+| Fencing tests | 4 | 4 | 4 | 4 |
+| Seeded-kill scenarios (seeds 1–6) | 1 | 1 | 1 | 1 |
+| Telemetry (provider-agnostic, file-backed) | 1 | — | — | — |
+| Dashboard HTTP tests (file provider) | 6 | — | — | — |
+| **Totals** | **139** | **131** | **127** | **127** |
+
 ## Foundation sections → implemented / not yet
 
 | Foundation | State in P0 |
@@ -307,16 +453,16 @@ Updated totals (the P1 matrix plus P2):
 | §2 Guarantee contract | Normative in README + code docs; enforced by scenarios B and E (both gateway modes asserted) |
 | §4 Architecture / stage A | Library core present: orchestrator context, checkpoint-by-append, recovery by replay. The `IHistoryStore` seam has four conformance-proven providers (file, SQL Server, PostgreSQL, SQLite); stage B/C remain interfaces only |
 | §5.3 Execution model (P0 subset) | Sequential durable awaits, recorded-result replay, and the `WhenAll` fan-out implemented (`CallAllAsync`): branches are scheduled synchronously in list order — per-branch activity identity, input fingerprint and ADR-012 key settled before any branch executes — then run concurrently, each completion recorded as it lands, results combined in schedule order regardless of completion order; proven by scenarios L/M/N and the fan-out unit tests. P2 added the durable-wait mechanisms on the same command model: retry policies (per call or per fan-out branch), durable timers, and signals — see the P2 section. P0 form keeps the activity body with the call; name→registry resolution and the §5.1 two-argument surface are not built. Roslyn analyzers (ADR-006, Proposed) not built; replay validation is the active enforcement layer |
-| §6.1 Event model | Schema v1 emits: `WorkflowStarted`, `ActivityScheduled`, `ActivityAttemptStarted`, `ActivityAttemptFailed` (P2 retries), `ActivityCompleted`, `WorkflowCompleted`, `TimerScheduled`, `TimerFired` (P2 timers), `SignalReceived` (P2 signals). Remaining §6.1 types are reserved for their phases. Payload separation/encryption (ADR-014/017) not built — payloads currently sit inside completion records |
-| §6.2 Checkpoint atomicity | Append+fsync per event against the file provider; one serializable transaction per append against the database providers (P1). Snapshots ride the same atomicity: atomic rename on the file provider, the append's own transaction on the database providers |
+| §6.1 Event model | Schema v1 emits: `WorkflowStarted`, `ActivityScheduled`, `ActivityAttemptStarted`, `ActivityAttemptFailed` (P2 retries), `ActivityCompleted`, `WorkflowCompleted`, `TimerScheduled`, `TimerFired` (P2 timers), `SignalReceived` (P2 signals), `VersionMarker` (final wave, P4 gates). Remaining §6.1 types (sub-workflow events) are reserved for their phases. Payload encryption (ADR-014/017) is built — see the final-wave section; payloads still sit inside completion records, encrypted as whole records |
+| §6.2 Checkpoint atomicity | Append+fsync per event against the file provider; one serializable transaction per append against the database providers (P1). Snapshots ride the same atomicity: atomic rename on the file provider, the append's own transaction on the database providers. Fencing verification rides the append transaction on the database providers |
 | §6.3 Deterministic replay & validation | Implemented and asserted (see mapping above) |
-| §6.5 Provider conformance | One suite, executed per provider (file, SQL Server, PostgreSQL, SQLite), 265 tests green with all four — see the P1 and P2 sections for the matrices and the named adaptations |
-| §7 Fault testing | Harness present (fixed kill points across all four providers), extended by P2 with the between-attempts kill (O), the kill-while-waiting (P, Q). Seeded randomized kill-point scheduling is harness growth, not yet built |
-| §8 Idempotency & side effects | Stable keys + propagation via `ActivityContext` implemented. Side-effect classes, engine-managed transactional path, outbox, dedup helper, reconciliation *hooks* (`IReconciliationCheck`) are not built — reconciliation exists as the harness's resumable command (scenario E), not yet as a runtime API. §8.5 key-retention window policy is design only |
-| §9 Leases/fencing (stage B) | Not built. Single-writer OS lock (scenario K); the database providers add the in-database analogues (SQL Server session application lock, PostgreSQL advisory lock — cooperative, see P1 sections). Cross-machine fencing is P3 |
-| §10 Versioning | Detection-and-halt only (safe failure). Version gates and golden-history corpus are P4 |
-| §11 Dashboard / OTEL | Not built (P5) |
-| §12 Tenancy/security | Namespace id is carried in key derivation and shaped in the schema (ADR-010); single-namespace runtime. Isolation suite, payload encryption, crypto-erasure: not built |
+| §6.5 Provider conformance | One suite, executed per provider (file, SQL Server, PostgreSQL, SQLite), 524 tests green with all four — see the P1, P2, and final-wave sections for the matrices and the named adaptations |
+| §7 Fault testing | Harness present (fixed kill points across all four providers), extended by P2 with the between-attempts kill (O), the kill-while-waiting (P, Q), and by the final wave with seeded randomized kill scheduling (seeds 1–6 per provider, deterministic reproduction by seed + run index) |
+| §8 Idempotency & side effects | Stable keys + propagation via `ActivityContext` implemented. §8.5 key-retention window is built (derived key registry + explicit purge, see the final-wave section). Side-effect classes, engine-managed transactional path, outbox, dedup helper, reconciliation *hooks* (`IReconciliationCheck`) are not built — reconciliation exists as the harness's resumable command (scenario E), not yet as a runtime API |
+| §9 Leases/fencing (stage B) | Fencing core built (final wave): per-instance leases with monotonic tokens on all four providers, append-time verification, stale-writer refusal — cooperative, inside one store; its limits are stated in the final-wave section. The stage-B distributed runtime and cross-database consensus are not built |
+| §10 Versioning | Version gates built (final wave, P4 core): `GetVersion` with `VersionMarker` events, range refusals, pre-gate default. A golden-history corpus is not built |
+| §11 Dashboard / OTEL | Built (final wave): `EngineDiagnostics` ActivitySource + Meter with an in-memory listener test; the ASP.NET Core dashboard with list / verified-history detail / signal sending and HTTP tests |
+| §12 Tenancy/security | Namespace id is carried in key derivation and shaped in the schema (ADR-010); single-namespace runtime. Payload encryption built (final wave); the multi-namespace isolation suite and crypto-erasure of whole histories are not built |
 | §13 Benchmarks | Not run — targets are P6 evidence, not P0 claims |
 
 ## Deviation note — SQL Server in the §14 P0 scope line (closed in P1)
@@ -337,16 +483,23 @@ P1 item, ahead of PostgreSQL and the SQLite development provider, gated
 by the §6.5 conformance suite running against a real SQL Server — see
 the P1 section above.
 
-## Named gaps — untouched by design
+## Named gaps — what is actually left
 
-- Seeded randomized kill-point scheduling (§7 harness growth, P1).
 - Real power loss: process kills are not power cuts; fsync-per-append and
   atomic renames are the strongest claims made, and directory-entry
-  durability under power loss is a filesystem/hardware property.
-- Code-version migration: changed code is detected and halted (safe
-  failure); version gates that let changed code legitimately continue old
-  histories are P4.
-- Gateway idempotency-key expiry (§8.5 retention window): policy documented
-  in the foundation; no expiring-key stub or routing behaviour is built.
-- Cross-device fencing: single-machine OS lock and the database
-  providers' cooperative in-database locks only; lease fencing is P3.
+  durability under power loss is a filesystem/hardware property. Proving
+  it needs a machine whose power can actually be cut — it cannot be
+  produced in this build sandbox, and no lesser test is presented as it.
+- Cross-database consensus and the stage-B/C distributed runtime:
+  fencing (above) is cooperative inside one store. Coordinating writers
+  across databases or machines — consensus, leader election, a hosted
+  runtime service — is a separate stage and is not claimed by anything
+  in this repository.
+- Sub-workflow event types: still reserved in the §6.1 schema; child
+  workflows are not built.
+- Side-effect machinery beyond keys and reconciliation-by-command:
+  side-effect classes, the engine-managed transactional path, an outbox,
+  and reconciliation hooks (`IReconciliationCheck`) are not built.
+- A golden-history corpus for versioning, the multi-namespace isolation
+  suite, crypto-erasure of whole histories, and §13 benchmarks: not
+  built, not claimed.

@@ -4,10 +4,10 @@ using System.Text.Json.Nodes;
 namespace DurableExecution.History;
 
 /// <summary>
-/// Event type names of schema v1 (foundation §6.1, ADR-014). P0 emits the
-/// subset its mechanisms produce; the remaining §6.1 types (timers, signals,
-/// sub-workflows, version markers) are reserved and land with the phases
-/// that build those mechanisms. Events are never updated or deleted.
+/// Event type names of schema v1 (foundation §6.1, ADR-014). Each type is
+/// emitted by the phase that builds its mechanism (timers and signals in P2,
+/// version markers with the P4 version gates); sub-workflow types remain
+/// reserved. Events are never updated or deleted.
 /// </summary>
 public static class HistoryEventTypes
 {
@@ -20,12 +20,13 @@ public static class HistoryEventTypes
     public const string SignalReceived = "SignalReceived";
     public const string ActivityCompleted = "ActivityCompleted";
     public const string WorkflowCompleted = "WorkflowCompleted";
+    public const string VersionMarker = "VersionMarker";
 
     internal static readonly HashSet<string> Known = new()
     {
         WorkflowStarted, ActivityScheduled, ActivityAttemptStarted,
         ActivityAttemptFailed, ActivityCompleted, WorkflowCompleted,
-        TimerScheduled, TimerFired, SignalReceived,
+        TimerScheduled, TimerFired, SignalReceived, VersionMarker,
     };
 }
 
@@ -147,5 +148,19 @@ public sealed class HistoryEvent
         {
             if (result is not null)
                 f["result"] = JsonSerializer.SerializeToNode(result);
+        });
+
+    /// <summary>
+    /// A code-version gate decision (P4): the first live pass of a
+    /// <c>GetVersion</c> call records which version of a named change the
+    /// workflow took, so every later replay takes the same branch. Markers
+    /// carry no command sequence — they are consumed in their own recorded
+    /// order, matched by change id.
+    /// </summary>
+    public static HistoryEvent VersionMarker(string instanceId, string changeId, long version) =>
+        Create(HistoryEventTypes.VersionMarker, instanceId, f =>
+        {
+            f["changeId"] = changeId;
+            f["version"] = version;
         });
 }
