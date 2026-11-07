@@ -10,6 +10,9 @@
   <ItemGroup>
     <!-- The suite crafts sealed records directly to test corruption handling. -->
     <InternalsVisibleTo Include="DurableExecution.Tests" />
+    <!-- Providers seal records with the same internal checksum the file
+         provider uses; the seal is one implementation for every medium. -->
+    <InternalsVisibleTo Include="DurableExecution.SqlServer" />
   </ItemGroup>
 
 </Project>

@@ -11,9 +11,15 @@ namespace DurableExecution.Tests.Unit;
 /// recorded key, and a changed branch definition is caught by the same
 /// fingerprint checks as a sequential call. (The same semantics across real
 /// process kills are the FanOut scenarios.)
+///
+/// Written once, run per provider (§6.5 conformance).
 /// </summary>
-public class FanOutTests
+public abstract class FanOutTests(IStoreFactory factory) : IDisposable
 {
+    protected IStoreFactory Factory { get; } = factory;
+
+    public void Dispose() => Factory.Dispose();
+
     private static string FreshDir()
     {
         string dir = Path.Combine(Path.GetTempPath(), "p0-unit", Guid.NewGuid().ToString("N")[..8]);
@@ -21,13 +27,17 @@ public class FanOutTests
         return dir;
     }
 
-    private static WorkflowHost OpenHost(string dir) =>
-        new(new FileHistoryStore(dir), dir);
+    private WorkflowHost OpenHost(string dir) =>
+        new(Factory.CreateStore(dir), dir);
 
     private sealed class SimulatedCrashException : Exception { }
 
-    private static IReadOnlyList<HistoryEvent> LoadHistory(string dir) =>
-        new FileHistoryStore(dir).Load().Events;
+    private IReadOnlyList<HistoryEvent> LoadHistory(string dir)
+    {
+        var store = Factory.CreateStore(dir);
+        try { return store.Load().Events; }
+        finally { (store as IDisposable)?.Dispose(); }
+    }
 
     [Fact]
     public async Task ResultsCombineInScheduleOrder_RegardlessOfCompletionOrder()
@@ -60,18 +70,20 @@ public class FanOutTests
             return string.Join(",", results);
         };
 
-        using var host = OpenHost(dir);
-        var run = host.RunAsync("order/v1", "order-1001", new { amount = 1000 }, body);
-        await Task.WhenAll(started.Select(s => s.Task)).WaitAsync(TimeSpan.FromSeconds(30));
+        using (var host = OpenHost(dir))
+        {
+            var run = host.RunAsync("order/v1", "order-1001", new { amount = 1000 }, body);
+            await Task.WhenAll(started.Select(s => s.Task)).WaitAsync(TimeSpan.FromSeconds(30));
 
-        // Complete the branches in reverse order: 3, then 2, then 1.
-        gates[2].TrySetResult();
-        await Task.Delay(150);
-        gates[1].TrySetResult();
-        await Task.Delay(150);
-        gates[0].TrySetResult();
+            // Complete the branches in reverse order: 3, then 2, then 1.
+            gates[2].TrySetResult();
+            await Task.Delay(150);
+            gates[1].TrySetResult();
+            await Task.Delay(150);
+            gates[0].TrySetResult();
 
-        Assert.Equal(WorkflowRunOutcome.Completed, await run.WaitAsync(TimeSpan.FromSeconds(30)));
+            Assert.Equal(WorkflowRunOutcome.Completed, await run.WaitAsync(TimeSpan.FromSeconds(30)));
+        }
         Assert.Equal(new[] { "r1", "r2", "r3" }, joined!); // schedule order, not arrival order
 
         // And the completions really did land in history in reverse order —
@@ -312,3 +324,11 @@ public class FanOutTests
         Assert.Equal(new[] { 1, 1 }, executions); // both branches' results came from history on resume
     }
 }
+
+/// <summary>Fan-out unit tests against the file provider (the P0 evidence, unchanged).</summary>
+[Trait("Provider", "File")]
+public sealed class FanOutTestsFile() : FanOutTests(new FileStoreFactory());
+
+/// <summary>Fan-out unit tests against the SQL Server provider (§6.5 conformance).</summary>
+[Trait("Provider", "SqlServer")]
+public sealed class FanOutTestsSqlServer() : FanOutTests(new SqlStoreFactory());

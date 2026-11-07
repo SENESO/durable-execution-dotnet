@@ -72,9 +72,13 @@ public static class StateAssert
     public static List<JsonElement> History(string stateDir) =>
         LoadJsonLines(stateDir, "history.log", "history");
 
-    public static List<JsonElement> Events(string stateDir, string type, long? seq = null, string? activity = null)
+    public static List<JsonElement> Events(string stateDir, string type, long? seq = null, string? activity = null) =>
+        Events(History(stateDir), type, seq, activity);
+
+    /// <summary>Events of one kind from a history read through a scenario provider (§6.5) — the provider owns where the records live.</summary>
+    public static List<JsonElement> Events(IReadOnlyList<JsonElement> history, string type, long? seq = null, string? activity = null)
     {
-        var rows = History(stateDir).Where(e => e.GetProperty("type").GetString() == type);
+        var rows = history.Where(e => e.GetProperty("type").GetString() == type);
         if (seq is not null)
             rows = rows.Where(e => e.TryGetProperty("seq", out var s) && s.GetInt64() == seq.Value);
         if (activity is not null)
@@ -83,16 +87,23 @@ public static class StateAssert
     }
 
     public static void WorkflowCompletedExactlyOnce(string stateDir) =>
-        Assert.True(Events(stateDir, "WorkflowCompleted").Count == 1,
+        WorkflowCompletedExactlyOnce(History(stateDir));
+
+    public static void WorkflowCompletedExactlyOnce(IReadOnlyList<JsonElement> history) =>
+        Assert.True(Events(history, "WorkflowCompleted").Count == 1,
             "workflow completed exactly once");
 
     /// <summary>The execution counter of an activity equals its recorded attempts — counters are cross-checked against history, not trusted.</summary>
-    public static void Consistency(string stateDir, string activity, string counterKey)
+    public static void Consistency(string stateDir, string activity, string counterKey) =>
+        Consistency(stateDir, History(stateDir), activity, counterKey);
+
+    /// <summary>The execution counter of an activity equals its recorded attempts — counters are cross-checked against history, not trusted.</summary>
+    public static void Consistency(string stateDir, IReadOnlyList<JsonElement> history, string activity, string counterKey)
     {
         var counters = Counters(stateDir);
-        var seqs = Events(stateDir, "ActivityScheduled", activity: activity)
+        var seqs = Events(history, "ActivityScheduled", activity: activity)
             .Select(e => e.GetProperty("seq").GetInt64()).ToHashSet();
-        int attempts = Events(stateDir, "ActivityAttemptStarted")
+        int attempts = Events(history, "ActivityAttemptStarted")
             .Count(e => seqs.Contains(e.GetProperty("seq").GetInt64()));
         Assert.True(counters.TryGetValue(counterKey, out int recorded),
             $"consistency: counters.{counterKey} present");

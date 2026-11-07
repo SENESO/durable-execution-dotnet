@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\DurableExecution.Core\DurableExecution.Core.csproj" />
+    <ProjectReference Include="..\..\src\DurableExecution.SqlServer\DurableExecution.SqlServer.csproj" />
   </ItemGroup>
 
 </Project>

@@ -1,6 +1,7 @@
 using DurableExecution.Execution;
 using DurableExecution.History;
 using DurableExecution.IO;
+using DurableExecution.SqlServer;
 
 namespace DurableExecution.TestHost;
 
@@ -37,7 +38,24 @@ public static class Program
 
         try
         {
-            var store = new FileHistoryStore(stateDir, new TornWriteInjector());
+            // The history provider is a scenario dimension (§6.5 conformance):
+            // file by default, SQL Server when the suite provisions a scratch
+            // database and passes its connection string in the environment.
+            // Everything else — state directory, lock, counters, gateway —
+            // is identical, so a scenario's evidence differs only in the
+            // persistence medium it claims to cover.
+            IHistoryStore store;
+            if ((Environment.GetEnvironmentVariable("HISTORY_PROVIDER") ?? "file") == "sqlserver")
+            {
+                string connection = Environment.GetEnvironmentVariable("HISTORY_SQLSERVER_CONNECTION")
+                    ?? throw new InvalidOperationException(
+                        "HISTORY_SQLSERVER_CONNECTION is required for the sqlserver provider");
+                store = new SqlHistoryStore(connection, instanceId, new TornWriteInjector());
+            }
+            else
+            {
+                store = new FileHistoryStore(stateDir, new TornWriteInjector());
+            }
             using var host = new WorkflowHost(store, stateDir);
 
             if (holdSeconds > 0)

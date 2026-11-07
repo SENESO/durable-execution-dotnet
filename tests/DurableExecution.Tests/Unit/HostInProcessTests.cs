@@ -9,9 +9,15 @@ namespace DurableExecution.Tests.Unit;
 /// execution counters as proof, fingerprint enforcement at resume, and
 /// single-writer ownership. (The same scenarios run across real process kills
 /// in the Scenarios classes; here the host is abandoned mid-flight instead.)
+///
+/// Written once, run per provider (§6.5 conformance).
 /// </summary>
-public class HostInProcessTests
+public abstract class HostInProcessTests(IStoreFactory factory) : IDisposable
 {
+    protected IStoreFactory Factory { get; } = factory;
+
+    public void Dispose() => Factory.Dispose();
+
     private static string FreshDir()
     {
         string dir = Path.Combine(Path.GetTempPath(), "p0-unit", Guid.NewGuid().ToString("N")[..8]);
@@ -19,8 +25,8 @@ public class HostInProcessTests
         return dir;
     }
 
-    private static WorkflowHost OpenHost(string dir) =>
-        new(new FileHistoryStore(dir), dir);
+    private WorkflowHost OpenHost(string dir) =>
+        new(Factory.CreateStore(dir), dir);
 
     private sealed class SimulatedCrashException : Exception { }
 
@@ -224,3 +230,11 @@ public class HostInProcessTests
         Assert.Throws<StateOwnedByAnotherHostException>(() => OpenHost(dir));
     }
 }
+
+/// <summary>Host tests against the file provider (the P0 evidence, unchanged).</summary>
+[Trait("Provider", "File")]
+public sealed class HostInProcessTestsFile() : HostInProcessTests(new FileStoreFactory());
+
+/// <summary>Host tests against the SQL Server provider (§6.5 conformance).</summary>
+[Trait("Provider", "SqlServer")]
+public sealed class HostInProcessTestsSqlServer() : HostInProcessTests(new SqlStoreFactory());

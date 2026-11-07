@@ -11,27 +11,33 @@ namespace DurableExecution.Tests.Scenarios;
 /// recorded is provable from state, per branch. Branch timing inside the
 /// host is scenario scaffolding that stages the kill point; the workflow's
 /// activities, inputs and order never change between runs.
+///
+/// Written once, run per provider (§6.5 conformance).
 /// </summary>
-public class ScenarioFanOutTests
+public abstract class ScenarioFanOutTests(ScenarioProvider provider) : IDisposable
 {
+    protected ScenarioProvider Provider { get; } = provider;
+
+    public void Dispose() => Provider.Dispose();
+
     private const string Instance = "order-1001";
 
-    private static int Attempts(string state, long seq) =>
-        StateAssert.Events(state, "ActivityAttemptStarted", seq).Count;
+    private int Attempts(string state, long seq) =>
+        StateAssert.Events(Provider.History(state), "ActivityAttemptStarted", seq).Count;
 
     private static string ExpectedKey(long seq) =>
         Fingerprints.DeriveIdempotencyKey("default", Instance, seq, "ChargeCard");
 
-    private static void ScheduleKeysAreAdr012(string state)
+    private void ScheduleKeysAreAdr012(string state)
     {
         for (long seq = 1; seq <= 3; seq++)
         {
-            var scheduled = Assert.Single(StateAssert.Events(state, "ActivityScheduled", seq));
+            var scheduled = Assert.Single(StateAssert.Events(Provider.History(state), "ActivityScheduled", seq));
             Assert.Equal(ExpectedKey(seq), scheduled.GetProperty("idempotencyKey").GetString());
         }
     }
 
-    private static void GatewayOutcomesForRef(string state, int branch, params string[] expected)
+    private void GatewayOutcomesForRef(string state, int branch, params string[] expected)
     {
         string merchantRef = $"{Instance}-fan{branch}";
         var rows = StateAssert.GatewayCalls(state)
@@ -47,18 +53,18 @@ public class ScenarioFanOutTests
     [Fact]
     public void L_KillMidFanOut_ResumeCompletesTheRest_ExactlyOncePerBranchKey()
     {
-        string state = HostProcess.FreshState("L");
+        string state = Provider.FreshState("L");
 
         // Branch 1 completes; branch 2 charges and is killed inside its
         // window (effect real, result unrecorded); branch 3 is still in
         // flight and never reaches its effect.
-        var run1 = HostProcess.Run(state, crashMode: "fanout-kill-mid", variant: "fanout");
+        var run1 = Provider.Run(state, crashMode: "fanout-kill-mid", variant: "fanout");
         Assert.True(run1.WasKilled, $"run1 killed by the crash point (exit {run1.ExitCode})");
 
-        Assert.Equal(3, StateAssert.Events(state, "ActivityScheduled").Count);
-        Assert.Single(StateAssert.Events(state, "ActivityCompleted", seq: 1));
-        Assert.Empty(StateAssert.Events(state, "ActivityCompleted", seq: 2));
-        Assert.Empty(StateAssert.Events(state, "ActivityCompleted", seq: 3));
+        Assert.Equal(3, StateAssert.Events(Provider.History(state), "ActivityScheduled").Count);
+        Assert.Single(StateAssert.Events(Provider.History(state), "ActivityCompleted", seq: 1));
+        Assert.Empty(StateAssert.Events(Provider.History(state), "ActivityCompleted", seq: 2));
+        Assert.Empty(StateAssert.Events(Provider.History(state), "ActivityCompleted", seq: 3));
         var counters1 = StateAssert.Counters(state);
         StateAssert.Need(counters1, "fanExecutions1", 1);
         StateAssert.Need(counters1, "fanExecutions2", 1);
@@ -66,7 +72,7 @@ public class ScenarioFanOutTests
         Assert.False(counters1.ContainsKey("fanExecutions3"),
             "branch 3 was in flight when the kill landed — its effect never ran");
 
-        var run2 = HostProcess.Run(state, variant: "fanout");
+        var run2 = Provider.Run(state, variant: "fanout");
         Assert.Equal(0, run2.ExitCode);
 
         var counters = StateAssert.Counters(state);
@@ -92,31 +98,31 @@ public class ScenarioFanOutTests
             c => c.GetProperty("Ref").GetString()!, c => c.GetProperty("Txn").GetString()!);
         string expected = string.Join(",",
             txnByRef[$"{Instance}-fan1"], txnByRef[$"{Instance}-fan2"], txnByRef[$"{Instance}-fan3"]);
-        var completed = Assert.Single(StateAssert.Events(state, "WorkflowCompleted"));
+        var completed = Assert.Single(StateAssert.Events(Provider.History(state), "WorkflowCompleted"));
         Assert.Equal(expected, completed.GetProperty("result").GetString());
-        StateAssert.WorkflowCompletedExactlyOnce(state);
+        StateAssert.WorkflowCompletedExactlyOnce(Provider.History(state));
     }
 
     [Fact]
     public void M_KillWithEveryBranchInFlight_ResumeExecutesEachBranchOnce()
     {
-        string state = HostProcess.FreshState("M");
+        string state = Provider.FreshState("M");
 
         // The kill lands while all three branches are in flight: every
         // branch is scheduled and attempted, none has completed, and no
         // branch has reached the gateway at all.
-        var run1 = HostProcess.Run(state, crashMode: "fanout-kill-early", variant: "fanout");
+        var run1 = Provider.Run(state, crashMode: "fanout-kill-early", variant: "fanout");
         Assert.True(run1.WasKilled, $"run1 killed by the crash point (exit {run1.ExitCode})");
 
-        Assert.Equal(3, StateAssert.Events(state, "ActivityScheduled").Count);
-        Assert.Empty(StateAssert.Events(state, "ActivityCompleted"));
+        Assert.Equal(3, StateAssert.Events(Provider.History(state), "ActivityScheduled").Count);
+        Assert.Empty(StateAssert.Events(Provider.History(state), "ActivityCompleted"));
         Assert.Equal(1, Attempts(state, 1));
         Assert.Equal(1, Attempts(state, 2));
         Assert.Equal(1, Attempts(state, 3));
         Assert.False(File.Exists(Path.Combine(state, "gateway-state.json")),
             "no branch reached the gateway before the kill");
 
-        var run2 = HostProcess.Run(state, variant: "fanout");
+        var run2 = Provider.Run(state, variant: "fanout");
         Assert.Equal(0, run2.ExitCode);
 
         var counters = StateAssert.Counters(state);
@@ -131,24 +137,24 @@ public class ScenarioFanOutTests
         GatewayOutcomesForRef(state, 1, "charged");
         GatewayOutcomesForRef(state, 2, "charged");
         GatewayOutcomesForRef(state, 3, "charged");
-        StateAssert.WorkflowCompletedExactlyOnce(state);
+        StateAssert.WorkflowCompletedExactlyOnce(Provider.History(state));
     }
 
     [Fact]
     public void N_ChangedBranchInputAtResume_FingerprintViolationInsideTheFanOut()
     {
-        string state = HostProcess.FreshState("N");
+        string state = Provider.FreshState("N");
 
         // All three branches complete; the kill lands after the join, before
         // the workflow's own completion is recorded.
-        var run1 = HostProcess.Run(state, crashMode: "fanout-after-join", variant: "fanout");
+        var run1 = Provider.Run(state, crashMode: "fanout-after-join", variant: "fanout");
         Assert.True(run1.WasKilled, $"run1 killed by the crash point (exit {run1.ExitCode})");
-        Assert.Equal(3, StateAssert.Events(state, "ActivityCompleted").Count);
-        Assert.Empty(StateAssert.Events(state, "WorkflowCompleted"));
+        Assert.Equal(3, StateAssert.Events(Provider.History(state), "ActivityCompleted").Count);
+        Assert.Empty(StateAssert.Events(Provider.History(state), "WorkflowCompleted"));
 
         // Resume with branch 2's input changed: the fan-out's scheduling
         // phase must refuse — a branch position is a recorded position.
-        var run2 = HostProcess.Run(state, variant: "fanout",
+        var run2 = Provider.Run(state, variant: "fanout",
             extraEnv: new Dictionary<string, string> { ["FAN_BRANCH2_AMOUNT"] = "9999" });
         Assert.Equal(4, run2.ExitCode);
         Assert.Contains("input fingerprint", run2.Output);
@@ -159,6 +165,14 @@ public class ScenarioFanOutTests
         StateAssert.Need(counters, "fanExecutions2", 1);
         StateAssert.Need(counters, "fanExecutions3", 1);
         StateAssert.Need(counters, "chargesApplied", 3);
-        Assert.Empty(StateAssert.Events(state, "WorkflowCompleted"));
+        Assert.Empty(StateAssert.Events(Provider.History(state), "WorkflowCompleted"));
     }
 }
+
+/// <summary>Fan-out scenarios L–N against the file provider (the P0 evidence, unchanged).</summary>
+[Trait("Provider", "File")]
+public sealed class ScenarioFanOutTestsFile() : ScenarioFanOutTests(new FileScenarioProvider());
+
+/// <summary>Fan-out scenarios L–N against the SQL Server provider (§6.5 conformance).</summary>
+[Trait("Provider", "SqlServer")]
+public sealed class ScenarioFanOutTestsSqlServer() : ScenarioFanOutTests(new SqlScenarioProvider());

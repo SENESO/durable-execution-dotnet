@@ -6,8 +6,12 @@ not. The evidence rule (§7.2) governs every line: implemented-and-proven
 means the cited suite runs it green from a clean checkout via
 `./run-tests.sh`.
 
-**Latest recorded run: 47 tests, 47 passed, 0 failed** (16 scenario tests
-across real process kills; 31 unit tests in-process).
+**Latest recorded runs (2026-11-07, after P1's first item): 47 tests,
+47 passed, 0 failed** with `./run-tests.sh` on the file provider alone
+(the P0 evidence, unchanged), and **93 tests, 93 passed, 0 failed** with
+`DE_SQLSERVER_CONNECTION` set against a test SQL Server — the same suite
+run per provider under the §6.5 conformance gate (see the P1 section
+below for the coverage matrix).
 
 ## P0 acceptance criteria (Foundation §14) — status
 
@@ -68,43 +72,137 @@ changed branch input/activity refused at resume, duplicate branches keyed
 distinctly, empty fan-out consuming no command positions, and the
 non-generic overload.
 
+## P1, first item — SQL Server provider and the §6.5 conformance suite
+
+Delivered 2026-11-07, gated exactly as §6.5 requires: the provider ships
+because the shared suite runs green against it, not because the code
+compiles.
+
+**The provider** (`src/DurableExecution.SqlServer`, `SqlHistoryStore`):
+one instance's history as rows of `dbo.HistoryEvents (InstanceId, N,
+Payload)` in a caller-provisioned database. A row's payload is the
+identical sealed JSON record the file provider frames — same fields, same
+checksum (`HistorySealing`) — and load runs the same structural validator
+(`HistoryRecordValidator`, extracted from the file provider), so both
+media refuse the same damage with the same words (asserted by the F
+scenarios and the conformance corruption tests on both providers).
+
+- **Checkpoint atomicity (§6.2):** an append is one serializable
+  transaction — verify the table still ends where this store's counter
+  says, insert, commit. A crash mid-append leaves the whole record or
+  nothing; `TornTailTruncated` is always false, because a rolled-back
+  transaction is never committed — the file provider's torn tail is a
+  framing property of files, and scenario D asserts each provider's own
+  surfacing of the same contract (below).
+- **Single-writer (§9):** a dedicated connection holds an exclusive
+  session application lock (`sp_getapplock`, resource per instance) from
+  load until dispose — the OS lock's in-database analogue. A second store
+  for the same instance is refused (`StateOwnedByAnotherHostException`)
+  after a 2-second grace window that exists only because the server
+  reaps a killed owner's session asynchronously; a live owner outlasts
+  the window and is refused. Appends additionally re-verify the
+  end-of-history inside their transaction, so a writer that bypasses the
+  cooperative lock and appends anyway is detected and refused over.
+  Limits, honestly: the lock is cooperative, and none of this fences
+  writers across databases or machines — cross-device fencing stays P3
+  and is not faked here.
+- **The fault seam's meaning on this provider:** the harness's
+  torn-write kill fires inside the append transaction; the process dies,
+  the connection dies with it, and the server rolls the record back.
+
+**The conformance suite (§6.5):** the scenario bodies (A–N), the store
+contract tests, and the host/fan-out unit tests are each written once
+against a provider surface and executed per provider via derived test
+classes (trait `Provider=File` / `Provider=SqlServer`). `run-tests.sh`
+excludes the SQL Server classes unless `DE_SQLSERVER_CONNECTION` names a
+test server, so the file evidence (47) stays reproducible anywhere and
+the SQL evidence is claimed only where it ran. SQL runs provision and
+drop one scratch database per test; no connection string exists in the
+repository. Environment note: the suite runs under the xunit console
+runner (vstest's host cannot connect in the build sandbox), and the
+runner's flat assembly probing loads SqlClient's platform facade instead
+of the deps-selected implementation — the test project pre-loads the
+correct runtime asset in a module initializer
+(`SqlClientRuntimeAsset.cs`), which is a no-op under a normal app host.
+
+| Evidence | File | SQL Server |
+|---|---|---|
+| Scenarios A–E (§7.3 + clean run + mid-write) | 5 | 5 |
+| Scenarios F–K (corruption, determinism, loop, ownership) | 8 | 8 |
+| Fan-out scenarios L–N | 3 | 3 |
+| Store conformance contract (append/load, corruption rules) | 10 | 10 |
+| Host unit tests | 8 | 8 |
+| Fan-out unit tests | 8 | 8 |
+| SQL-provider-specific (session lock, instance isolation) | — | 4 |
+| File-framing only (torn tail truncation/report) | 1 | — |
+| Keys and fingerprints (provider-agnostic) | 4 | — |
+| **Totals** | **47** | **46** |
+
+Named adaptations, with reasons:
+
+- **Scenario D** runs on both providers with provider-shaped discard
+  evidence: on the file provider, unterminated bytes on disk plus the
+  "torn tail" report on resume; on SQL Server, the killed append's row
+  simply absent (rolled back) and no torn-tail claim made. The contract
+  asserted identically on both: the interrupted completion is not
+  committed, the command re-executes under its recorded key, the gateway
+  deduplicates (chargeExecutions 2, chargesApplied 1).
+- **The torn-tail unit test** stays file-only: truncating an unterminated
+  tail is a framing behaviour a transactional medium does not have.
+- **Scenario K** asserts the host's ownership refusal on both providers
+  (the host file lock fires first); the SQL store's own session-lock
+  refusal is asserted directly by the provider-specific tests above.
+
+The SQL evidence was produced against SQL Server 2022 (Developer
+Edition) running in the build environment, installed from the kept
+package and driven under a dedicated least-privilege test login
+(`dbcreator` only, so the suite can provision its scratch databases);
+the databases are dropped by the tests, verified empty afterwards.
+
 ## Foundation sections → implemented / not yet
 
 | Foundation | State in P0 |
 |---|---|
 | §2 Guarantee contract | Normative in README + code docs; enforced by scenarios B and E (both gateway modes asserted) |
-| §4 Architecture / stage A | Library core present: orchestrator context, checkpoint-by-append, recovery by replay. Stage B/C are interfaces only (`IHistoryStore` seam) |
+| §4 Architecture / stage A | Library core present: orchestrator context, checkpoint-by-append, recovery by replay. The `IHistoryStore` seam has two conformance-proven providers (file, SQL Server); stage B/C remain interfaces only |
 | §5.3 Execution model (P0 subset) | Sequential durable awaits, recorded-result replay, and the `WhenAll` fan-out implemented (`CallAllAsync`): branches are scheduled synchronously in list order — per-branch activity identity, input fingerprint and ADR-012 key settled before any branch executes — then run concurrently, each completion recorded as it lands, results combined in schedule order regardless of completion order; proven by scenarios L/M/N and the fan-out unit tests. P0 form keeps the activity body with the call; name→registry resolution and the §5.1 two-argument surface are not built. Roslyn analyzers (ADR-006, Proposed) not built; replay validation is the active enforcement layer |
 | §6.1 Event model | Schema v1 emits the P0 subset: `WorkflowStarted`, `ActivityScheduled`, `ActivityAttemptStarted`, `ActivityCompleted`, `WorkflowCompleted`. Remaining §6.1 types are reserved for their phases. Payload separation/encryption (ADR-014/017) not built — payloads currently sit inside completion records |
-| §6.2 Checkpoint atomicity | Append+fsync per event against the file provider. Database-transaction checkpoints arrive with the SQL providers (P1) |
+| §6.2 Checkpoint atomicity | Append+fsync per event against the file provider; one serializable transaction per append against the SQL Server provider (P1) |
 | §6.3 Deterministic replay & validation | Implemented and asserted (see mapping above) |
-| §6.5 Provider conformance | Not yet — the suite exists per provider starting P1. The file provider is validated by the scenario suite + store unit tests |
-| §7 Fault testing | Harness present in minimal P0 form (fixed kill points). Seeded randomized kill-point scheduling is P1 harness growth |
+| §6.5 Provider conformance | Implemented with P1's first item: one suite, executed per provider (file + SQL Server), 93 tests green with both — see the P1 section for the matrix and the named adaptations |
+| §7 Fault testing | Harness present in minimal P0 form (fixed kill points), now across both providers. Seeded randomized kill-point scheduling is P1 harness growth, not yet built |
 | §8 Idempotency & side effects | Stable keys + propagation via `ActivityContext` implemented. Side-effect classes, engine-managed transactional path, outbox, dedup helper, reconciliation *hooks* (`IReconciliationCheck`) are not built — reconciliation exists as the harness's resumable command (scenario E), not yet as a runtime API. §8.5 key-retention window policy is design only |
-| §9 Leases/fencing (stage B) | Not built. Single-writer OS lock only (scenario K); cross-machine fencing is P3 |
+| §9 Leases/fencing (stage B) | Not built. Single-writer OS lock (scenario K); the SQL provider adds the in-database analogue (session application lock, cooperative — see P1 section). Cross-machine fencing is P3 |
 | §10 Versioning | Detection-and-halt only (safe failure). Version gates and golden-history corpus are P4 |
 | §11 Dashboard / OTEL | Not built (P5) |
 | §12 Tenancy/security | Namespace id is carried in key derivation and shaped in the schema (ADR-010); single-namespace runtime. Isolation suite, payload encryption, crypto-erasure: not built |
 | §13 Benchmarks | Not run — targets are P6 evidence, not P0 claims |
 
-## Deviation note — SQL Server in the §14 P0 scope line
+## Deviation note — SQL Server in the §14 P0 scope line (closed in P1)
 
-§14's P0 scope line names "SQL Server persistence (first provider)". This
-stage delivers the persistence seam (`IHistoryStore`) and the file provider —
-the provider whose behaviour the accepted crash-recovery proof (§19,
-condition 7) actually exercised — and does **not** deliver a SQL Server
-provider. Reason, under the project's own law: a provider advances only on
-reproducible test evidence (§7.2), §6.5 makes the conformance suite the gate
-for any provider, and that suite is P1's acceptance work; no SQL Server was
-available in the build environment to produce evidence against. The SQL
-Server provider is therefore the first P1 item, ahead of PostgreSQL and the
-SQLite development provider. This is a sequencing deviation from the §14
-scope line, recorded openly rather than absorbed silently; the §14 P0
-*acceptance criteria* (which are store-agnostic) are met in full.
+§14's P0 scope line names "SQL Server persistence (first provider)". The
+P0 stage delivered the persistence seam (`IHistoryStore`) and the file
+provider — the provider whose behaviour the accepted crash-recovery proof
+(§19, condition 7) actually exercised — and did **not** deliver a SQL
+Server provider, because a provider advances only on reproducible test
+evidence (§7.2), §6.5 makes the conformance suite the gate for any
+provider, and no SQL Server was available in the build environment to
+produce evidence against. That sequencing deviation was recorded openly
+rather than absorbed silently; the §14 P0 *acceptance criteria* (which
+are store-agnostic) were met in full.
 
-## Named gaps — untouched in P0, by design
+**Closed 2026-11-07:** the SQL Server provider is delivered as the first
+P1 item, ahead of PostgreSQL and the SQLite development provider, gated
+by the §6.5 conformance suite running against a real SQL Server — see
+the P1 section above.
 
-- SQL Server persistence and transactional atomicity (P1, see deviation note).
+## Named gaps — untouched by design
+
+- PostgreSQL and SQLite providers (later P1 items; each ships only
+  through the same §6.5 gate).
+- Snapshots (P1): history is still replayed in full; the SQL provider
+  does not change that.
+- Seeded randomized kill-point scheduling (§7 harness growth, P1).
 - Real power loss: process kills are not power cuts; fsync-per-append and
   atomic renames are the strongest claims made, and directory-entry
   durability under power loss is a filesystem/hardware property.
@@ -113,6 +211,6 @@ scope line, recorded openly rather than absorbed silently; the §14 P0
   histories are P4.
 - Gateway idempotency-key expiry (§8.5 retention window): policy documented
   in the foundation; no expiring-key stub or routing behaviour is built.
-- Cross-device fencing: single-machine OS lock only; lease fencing is P3.
+- Cross-device fencing: single-machine OS lock and the SQL provider's
+  cooperative in-database lock only; lease fencing is P3.
 - Timers, signals, retries: P2 by the roadmap — explicitly out of P0 scope.
-- Snapshots: P1. History is replayed in full in P0.

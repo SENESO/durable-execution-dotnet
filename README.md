@@ -10,12 +10,13 @@ long-running process as ordinary C# code, and the engine owns continuity —
 if the host crashes or restarts, the process resumes from its recorded
 history instead of starting over or stopping half-done.
 
-This repository is **stage A (the embeddable library) at phase P0**: the
-durable execution core. It is built under one governing rule, taken from the
-Engineering Foundation (§7.2): **no phase advances on "the code works" — a
-phase advances only on reproducible test evidence.** The evidence command is
-`./run-tests.sh`; the current results and the exact scope of what is proven
-live in [STATUS.md](STATUS.md).
+This repository is **stage A (the embeddable library)**: the durable
+execution core (phase P0), plus P1's first item — the SQL Server history
+provider, admitted through the §6.5 conformance gate. It is built under one
+governing rule, taken from the Engineering Foundation (§7.2): **no phase
+advances on "the code works" — a phase advances only on reproducible test
+evidence.** The evidence command is `./run-tests.sh`; the current results
+and the exact scope of what is proven live in [STATUS.md](STATUS.md).
 
 ## The guarantee contract
 
@@ -106,16 +107,22 @@ by omission.
 
 ```
 src/DurableExecution.Core/        the library (stage A core)
-  History/                        event model, store seam, file provider
+  History/                        event model, store seam, file provider, shared record validation
   Execution/                      host, workflow context, identity, fingerprints
   IO/                             atomic durable file writes
+src/DurableExecution.SqlServer/   SQL Server history provider (P1)
 tests/DurableExecution.TestHost/  scenario host process the suite kills/restarts
-tests/DurableExecution.Tests/     xUnit: Scenarios (A–K, fan-out L–N) + Unit (store, keys, host, fan-out)
+tests/DurableExecution.Tests/     xUnit: Scenarios (A–K, fan-out L–N) + Unit (store, keys, host, fan-out), each run per provider
 ```
 
-`IHistoryStore` is the seam the distributed runtime (stage B) and the future
+`IHistoryStore` is the seam the distributed runtime (stage B) and the
 database providers consume; every provider must pass the shared conformance
-contract (Foundation §6.5) before it may ship.
+contract (Foundation §6.5) before it may ship. The SQL Server provider
+stores the identical sealed records as rows in a caller-provisioned
+database — one serializable transaction per append, and an exclusive
+session application lock as the single-writer mechanism inside the
+database (cooperative, within one database; cross-device fencing remains
+a later phase and is not claimed).
 
 ## Running the tests
 
@@ -124,12 +131,17 @@ contract (Foundation §6.5) before it may ship.
 ```
 
 Builds the solution in Release and runs the whole suite from a clean
-checkout. Latest recorded result (2026-11-07): **47 passed, 0 failed** —
-see STATUS.md for the breakdown and the scenario mapping.
+checkout. The suite runs per provider: the file provider always, and the
+SQL Server provider too when `DE_SQLSERVER_CONNECTION` names a test SQL
+Server (the suite provisions and drops one scratch database per test; no
+connection string lives in the repository). Latest recorded results
+(2026-11-07): **47 passed, 0 failed** on the file provider alone, and
+**93 passed, 0 failed** with both providers — see STATUS.md for the
+breakdown, the scenario mapping, and the conformance matrix.
 
 ## Not yet here
 
-SQL Server / PostgreSQL providers, snapshots, timers, retries, signals,
+PostgreSQL / SQLite providers, snapshots, timers, retries, signals,
 distributed leases and fencing, version gates, payload encryption and
 crypto-erasure, the dashboard. Each is a named phase or a named gap with its
 acceptance criteria in the Engineering Foundation; STATUS.md tracks them

@@ -1,7 +1,5 @@
 using System.Text;
-using System.Text.Json;
 using System.Text.Json.Nodes;
-using DurableExecution.Execution;
 
 namespace DurableExecution.History;
 
@@ -18,11 +16,13 @@ namespace DurableExecution.History;
 /// refused with <see cref="HistoryCorruptionException"/> — never deleted,
 /// never skipped.
 ///
-/// Structural validation on load: event types are a closed set with required
-/// typed fields; the event sequence is gapless; <c>WorkflowStarted</c> is the
-/// unique first event; a command is scheduled exactly once; attempt numbers
-/// are sequential per command; a completion must match its scheduled command's
-/// activity; <c>WorkflowCompleted</c> is unique and last.
+/// Structural validation on load is shared with every provider
+/// (<see cref="HistoryRecordValidator"/>): event types are a closed set with
+/// required typed fields; the event sequence is gapless;
+/// <c>WorkflowStarted</c> is the unique first event; a command is scheduled
+/// exactly once; attempt numbers are sequential per command; a completion
+/// must match its scheduled command's activity; <c>WorkflowCompleted</c> is
+/// unique and last.
 /// </summary>
 public sealed class FileHistoryStore : IHistoryStore
 {
@@ -40,17 +40,9 @@ public sealed class FileHistoryStore : IHistoryStore
 
     public string HistoryPath => _historyPath;
 
-    internal static string Canonical(JsonObject fields)
-    {
-        var copy = new JsonObject();
-        foreach (var kv in fields)
-            if (kv.Key != "sum")
-                copy[kv.Key] = kv.Value?.DeepClone();
-        return copy.ToJsonString();
-    }
+    internal static string Canonical(JsonObject fields) => HistorySealing.Canonical(fields);
 
-    internal static string Checksum(JsonObject fields) =>
-        Fingerprints.Sha256Hex(Canonical(fields))[..16];
+    internal static string Checksum(JsonObject fields) => HistorySealing.Checksum(fields);
 
     public HistoryLoadResult Load()
     {
@@ -83,100 +75,11 @@ public sealed class FileHistoryStore : IHistoryStore
             fs.SetLength(start);
         }
 
-        var scheduled = new Dictionary<long, string>();
-        var completed = new HashSet<long>();
-        var attempts = new Dictionary<long, long>();
-        bool startedSeen = false, workflowCompletedSeen = false;
-
+        var validator = new HistoryRecordValidator();
         for (int r = 0; r < records.Count; r++)
         {
             string line = Encoding.UTF8.GetString(bytes, records[r].Start, records[r].Length);
-            string ctx = $"record {r + 1}";
-            if (line.Length == 0)
-                throw Corrupt($"{ctx}: blank record");
-
-            JsonElement el;
-            try { el = JsonDocument.Parse(line).RootElement.Clone(); }
-            catch { throw Corrupt($"{ctx}: terminated record is not valid JSON"); }
-            if (el.ValueKind != JsonValueKind.Object)
-                throw Corrupt($"{ctx}: event is not a JSON object");
-
-            string type = ReqString(el, "type", ctx);
-            if (!HistoryEventTypes.Known.Contains(type))
-                throw Corrupt($"{ctx}: unknown event type '{type}'");
-            if (ReqLong(el, "v", ctx) != 1)
-                throw Corrupt($"{ctx}: unsupported schema version");
-            ReqString(el, "instance", ctx);
-            ReqString(el, "ts", ctx);
-            long n = ReqLong(el, "n", ctx);
-            if (n != r + 1)
-                throw Corrupt($"{ctx}: event sequence gap (expected n={r + 1}, found n={n})");
-
-            var asObject = JsonNode.Parse(line)!.AsObject();
-            if (!asObject.TryGetPropertyValue("sum", out var sumNode) ||
-                sumNode?.GetValue<string>() != Checksum(asObject))
-                throw Corrupt($"{ctx}: checksum mismatch (content tampered or partially written)");
-            if (workflowCompletedSeen)
-                throw Corrupt($"{ctx}: event recorded after WorkflowCompleted");
-
-            switch (type)
-            {
-                case HistoryEventTypes.WorkflowStarted:
-                    if (r != 0 || startedSeen)
-                        throw Corrupt($"{ctx}: WorkflowStarted must be the unique first event");
-                    startedSeen = true;
-                    ReqString(el, "def", ctx);
-                    if (!Fingerprints.IsHex64(ReqString(el, "inputHash", ctx)))
-                        throw Corrupt($"{ctx}: WorkflowStarted.inputHash malformed");
-                    break;
-
-                case HistoryEventTypes.ActivityScheduled:
-                {
-                    long seq = ReqLong(el, "seq", ctx);
-                    string activity = ReqString(el, "activity", ctx);
-                    if (!Fingerprints.IsHex64(ReqString(el, "idempotencyKey", ctx)))
-                        throw Corrupt($"{ctx}: idempotencyKey malformed");
-                    if (!Fingerprints.IsHex64(ReqString(el, "inputHash", ctx)))
-                        throw Corrupt($"{ctx}: inputHash malformed");
-                    if (seq < 1)
-                        throw Corrupt($"{ctx}: seq must be >= 1");
-                    if (!scheduled.TryAdd(seq, activity))
-                        throw Corrupt($"{ctx}: duplicate ActivityScheduled for command {seq}");
-                    break;
-                }
-
-                case HistoryEventTypes.ActivityAttemptStarted:
-                {
-                    long seq = ReqLong(el, "seq", ctx);
-                    long attempt = ReqLong(el, "attempt", ctx);
-                    if (!scheduled.ContainsKey(seq))
-                        throw Corrupt($"{ctx}: attempt for unscheduled command {seq}");
-                    long expected = attempts.GetValueOrDefault(seq) + 1;
-                    if (attempt != expected)
-                        throw Corrupt($"{ctx}: attempt numbers for command {seq} not sequential (expected {expected}, found {attempt})");
-                    attempts[seq] = attempt;
-                    break;
-                }
-
-                case HistoryEventTypes.ActivityCompleted:
-                {
-                    long seq = ReqLong(el, "seq", ctx);
-                    string activity = ReqString(el, "activity", ctx);
-                    if (!scheduled.TryGetValue(seq, out var scheduledActivity))
-                        throw Corrupt($"{ctx}: ActivityCompleted without ActivityScheduled for command {seq}");
-                    if (scheduledActivity != activity)
-                        throw Corrupt($"{ctx}: ActivityCompleted activity '{activity}' does not match scheduled '{scheduledActivity}'");
-                    if (!completed.Add(seq))
-                        throw Corrupt($"{ctx}: duplicate ActivityCompleted for command {seq}");
-                    break;
-                }
-
-                case HistoryEventTypes.WorkflowCompleted:
-                    workflowCompletedSeen = true;
-                    break;
-            }
-
-            events.Add(new HistoryEvent(asObject));
+            events.Add(validator.Validate(line, r + 1));
         }
 
         _nextSequence = events.Count + 1;
@@ -211,25 +114,5 @@ public sealed class FileHistoryStore : IHistoryStore
         }
         _nextSequence++;
         return new HistoryEvent(fields);
-    }
-
-    private static HistoryCorruptionException Corrupt(string message) => new(message);
-
-    private static long ReqLong(JsonElement e, string field, string ctx)
-    {
-        if (!e.TryGetProperty(field, out var v) ||
-            v.ValueKind != JsonValueKind.Number ||
-            !v.TryGetInt64(out long x))
-            throw Corrupt($"{ctx}: field '{field}' missing or not an integer");
-        return x;
-    }
-
-    private static string ReqString(JsonElement e, string field, string ctx)
-    {
-        if (!e.TryGetProperty(field, out var v) ||
-            v.ValueKind != JsonValueKind.String ||
-            string.IsNullOrEmpty(v.GetString()))
-            throw Corrupt($"{ctx}: field '{field}' missing or not a non-empty string");
-        return v.GetString()!;
     }
 }

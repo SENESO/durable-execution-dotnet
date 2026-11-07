@@ -99,5 +99,15 @@ public sealed class WorkflowHost : IDisposable
         return WorkflowRunOutcome.Completed;
     }
 
-    public void Dispose() => _ownershipLock.Dispose();
+    /// <summary>
+    /// Releases the single-writer lock file and, if the store holds resources
+    /// of its own (a database provider's session lock, say), disposes the
+    /// store with the host — the host owns the store it was given, so a
+    /// disposed host never leaves a store's ownership claim behind.
+    /// </summary>
+    public void Dispose()
+    {
+        _ownershipLock.Dispose();
+        (_store as IDisposable)?.Dispose();
+    }
 }

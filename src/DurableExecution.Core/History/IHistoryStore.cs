@@ -3,9 +3,10 @@ namespace DurableExecution.History;
 /// <summary>
 /// The persistence seam of the execution core: an append-only store for one
 /// workflow instance's history (foundation §6.1, §6.2). This interface is what
-/// the distributed runtime (stage B) and the future database providers consume;
+/// the distributed runtime (stage B) and the database providers consume;
 /// every provider must pass the shared conformance contract of §6.5 before it
-/// may ship. P0 ships one provider, <see cref="FileHistoryStore"/>.
+/// may ship. Providers: <see cref="FileHistoryStore"/> here, and the SQL
+/// Server provider in DurableExecution.SqlServer.
 /// </summary>
 public interface IHistoryStore
 {

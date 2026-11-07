@@ -13,6 +13,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DurableExecution.TestHost",
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DurableExecution.Tests", "tests\DurableExecution.Tests\DurableExecution.Tests.csproj", "{CF3C7477-DF32-43F8-B552-C2169D08DA4A}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DurableExecution.SqlServer", "src\DurableExecution.SqlServer\DurableExecution.SqlServer.csproj", "{D2D18A69-3E19-4F5F-89EA-F67D4D597E90}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -34,9 +36,14 @@ Global
 		{CF3C7477-DF32-43F8-B552-C2169D08DA4A}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{CF3C7477-DF32-43F8-B552-C2169D08DA4A}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{CF3C7477-DF32-43F8-B552-C2169D08DA4A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D2D18A69-3E19-4F5F-89EA-F67D4D597E90}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D2D18A69-3E19-4F5F-89EA-F67D4D597E90}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D2D18A69-3E19-4F5F-89EA-F67D4D597E90}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D2D18A69-3E19-4F5F-89EA-F67D4D597E90}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{967CE14F-A1ED-4ACF-ACA9-CA12CCA00E72} = {3B1305C5-3AA6-453D-92B8-4FD297F7876D}
+		{D2D18A69-3E19-4F5F-89EA-F67D4D597E90} = {3B1305C5-3AA6-453D-92B8-4FD297F7876D}
 		{72DF5B8C-19AE-4700-BA08-3B5806D166C5} = {561BEE6A-668C-49C1-B4CC-5423872535DA}
 		{CF3C7477-DF32-43F8-B552-C2169D08DA4A} = {561BEE6A-668C-49C1-B4CC-5423872535DA}
 	EndGlobalSection
