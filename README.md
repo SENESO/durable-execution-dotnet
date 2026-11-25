@@ -1,5 +1,7 @@
 # Durable Execution Platform for .NET — P0
 
+[![ci](https://github.com/SENESO/durable-execution-dotnet/actions/workflows/ci.yml/badge.svg)](https://github.com/SENESO/durable-execution-dotnet/actions/workflows/ci.yml)
+
 > Name and licence settled on 2026-11-07 (closing the open decisions in
 > Engineering Foundation §18 / ADR-009): the project is the **Durable
 > Execution Platform for .NET**, released under the **Apache License 2.0**
